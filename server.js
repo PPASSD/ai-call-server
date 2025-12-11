@@ -4,67 +4,43 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
 const http = require('http');
-const twilio = require('twilio');
-const fetch = require('node-fetch'); // for ElevenLabs API
+const axios = require('axios');
 
 const app = express();
 const port = process.env.PORT || 10000;
-
-// Twilio client
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
 app.use(bodyParser.json());
 
-// Map to track CallSid -> leadId
+// Track CallSid -> lead info
 const callMap = {};
 
-// ========== 1. Endpoint to trigger outbound call ==========
-app.post('/call-lead', async (req, res) => {
-  const { phone, contact_id, name } = req.body;
-
-  try {
-    const call = await client.calls.create({
-      to: phone,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      url: `${process.env.SERVER_URL}/twilio-voice-webhook?contact_id=${contact_id}&name=${encodeURIComponent(name)}`
-    });
-
-    callMap[call.sid] = contact_id;
-    console.log(`[Lead ${contact_id}] Outbound call started: ${call.sid}`);
-    res.json({ success: true, callSid: call.sid });
-  } catch (err) {
-    console.error(`[Lead ${contact_id}] Error starting call:`, err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ========== 2. Twilio Voice Webhook (TwiML) ==========
+// ======= Twilio Voice Webhook =======
 app.post('/twilio-voice-webhook', (req, res) => {
-  const { contact_id, name } = req.query;
-  const CallSid = req.body.CallSid || req.query.CallSid;
+  const { contact_id, phone, name, CallSid } = req.body;
 
-  if (CallSid && contact_id) callMap[CallSid] = contact_id;
-
-  console.log(`[Lead ${contact_id || 'unknown'}] Twilio webhook invoked. CallSid: ${CallSid}`);
+  if (CallSid && contact_id) {
+    callMap[CallSid] = contact_id;
+    console.log(`[Lead ${contact_id}] Twilio webhook received. CallSid: ${CallSid}`);
+  } else {
+    console.log(`[Lead unknown] Twilio webhook received without lead info`);
+  }
 
   const twiml = `
     <Response>
       <Start>
         <Stream url="wss://${req.headers.host}/stream?callSid=${CallSid}" />
       </Start>
-      <Say>Hello, this is your AI assistant. Please wait while I connect.</Say>
+      <Say>Hello, this is your AI assistant.</Say>
     </Response>
   `;
-
   res.type('text/xml');
   res.send(twiml);
 });
 
-// ========== 3. HTTP + WebSocket Setup ==========
+// ======= HTTP + WebSocket Setup =======
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-// Upgrade HTTP to WS
+// Upgrade HTTP -> WS
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const callSid = url.searchParams.get('callSid');
@@ -77,47 +53,101 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
-// ========== 4. Handle Twilio MediaStream ==========
-wss.on('connection', (ws) => {
+// ======= Real-time Streaming Handler =======
+wss.on('connection', async (ws) => {
   console.log(`[Lead ${ws.leadId}] Twilio MediaStream connected`);
 
+  let transcriptBuffer = '';
+
+  // Create Gemini WebSocket connection
+  const geminiWS = new WebSocket('wss://api.gemini.ai/flashlight/v2.5/stream', {
+    headers: {
+      'Authorization': `Bearer ${process.env.GEMINI_API_KEY}`,
+    },
+  });
+
+  geminiWS.on('open', () => console.log(`[Lead ${ws.leadId}] Connected to Gemini 2.5`));
+  geminiWS.on('message', async (msg) => {
+    const data = JSON.parse(msg);
+    if (data.text) {
+      // Send to ElevenLabs TTS
+      try {
+        const ttsResponse = await axios.post(
+          'https://api.elevenlabs.io/v1/stream',
+          { text: data.text, voice: 'alloy', format: 'pcm16' },
+          { responseType: 'arraybuffer', headers: { 'xi-api-key': process.env.ELEVENLABS_KEY } }
+        );
+
+        ws.send(Buffer.from(ttsResponse.data));
+      } catch (err) {
+        console.error(`[Lead ${ws.leadId}] ElevenLabs TTS error:`, err.message);
+      }
+    }
+  });
+
   ws.on('message', async (message) => {
-    // Log audio chunk size
-    console.log(`[Lead ${ws.leadId}] Audio chunk received: ${message.length} bytes`);
+    // message = PCM16 audio from Twilio
+    console.log(`[Lead ${ws.leadId}] Received audio chunk: ${message.length} bytes`);
 
-    // TODO: Send audio to DeepGram WebSocket
-    // Placeholder: transcribe audio
-    // const transcription = await sendAudioToDeepGram(message);
+    // 1️⃣ Stream audio to DeepGram
+    try {
+      const dgResponse = await axios.post(
+        'https://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000',
+        message,
+        {
+          headers: {
+            'Authorization': `Token ${process.env.DG_API_KEY}`,
+            'Content-Type': 'application/octet-stream',
+          },
+        }
+      );
 
-    // TODO: Generate AI response
-    // const aiResponse = await generateAIResponse(transcription);
+      const transcript = dgResponse.data?.results?.channels[0]?.alternatives[0]?.transcript || '';
+      transcriptBuffer += transcript + ' ';
+      console.log(`[Lead ${ws.leadId}] DeepGram transcript: ${transcript}`);
 
-    // TODO: Send AI response to ElevenLabs TTS
-    // const ttsAudio = await elevenLabsTTS(aiResponse);
-
-    // TODO: Send TTS back to Twilio call
-    // ws.send(ttsAudio);
+      // 2️⃣ Send partial transcript to Gemini WebSocket
+      if (geminiWS.readyState === WebSocket.OPEN) {
+        geminiWS.send(JSON.stringify({ prompt: transcriptBuffer, stream: true }));
+      }
+    } catch (err) {
+      console.error(`[Lead ${ws.leadId}] DeepGram error:`, err.message);
+    }
   });
 
   ws.on('close', () => {
     console.log(`[Lead ${ws.leadId}] Twilio MediaStream disconnected`);
     if (ws.callSid) delete callMap[ws.callSid];
+    geminiWS.close();
   });
 });
 
-// ========== 5. Placeholder functions for DeepGram & ElevenLabs ==========
-async function sendAudioToDeepGram(audioBuffer) {
-  // Implement DeepGram streaming API
-}
+// ======= Endpoint to initiate call =======
+app.post('/call-lead', async (req, res) => {
+  const { phone, name, contact_id } = req.body;
 
-async function generateAIResponse(transcription) {
-  // Implement AI model (OpenAI GPT) response
-}
+  try {
+    const callResponse = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Calls.json`,
+      new URLSearchParams({
+        To: phone,
+        From: process.env.TWILIO_NUMBER,
+        Url: `https://${req.headers.host}/twilio-voice-webhook`,
+      }),
+      {
+        auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_AUTH_TOKEN },
+      }
+    );
 
-async function elevenLabsTTS(text) {
-  // Implement TTS using ElevenLabs API
-}
+    console.log(`[Lead ${contact_id}] Outbound call started: ${callResponse.data.sid}`);
+    res.json({ success: true, callSid: callResponse.data.sid });
+  } catch (err) {
+    console.error(`[Lead ${contact_id}] Twilio call error:`, err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
+// ======= Start server =======
 server.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
