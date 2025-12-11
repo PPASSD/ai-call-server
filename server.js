@@ -1,4 +1,5 @@
-// server.js -- AI call server for Render with DeepGram logging
+// server.js -- minimal AI call server for Render with DeepGram
+
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -9,7 +10,9 @@ const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// -------------------- Environment Variables --------------------
+// --------------------
+// Environment Variables
+// --------------------
 const PORT = process.env.PORT || 10000;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -17,32 +20,35 @@ const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
 const BASE_URL = process.env.BASE_URL;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
-// -------------------- Helper Logging Function --------------------
-function logLead(leadId, message) {
-  console.log(`[${new Date().toISOString()}][Lead ${leadId}] ${message}`);
-}
-
-// -------------------- Check Env --------------------
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER || !BASE_URL || !DEEPGRAM_API_KEY) {
   console.warn('Missing required env vars. See README and .env.example.');
 }
 
-// -------------------- Twilio Client --------------------
 const twilioClient = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const WebSocket = require('ws');
 
-// -------------------- 1) GoHighLevel Outbound Call Endpoint --------------------
+// --------------------
+// Logging helper
+// --------------------
+function logLead(leadId, message) {
+  console.log(`[${new Date().toISOString()}][Lead ${leadId || 'unknown'}] ${message}`);
+}
+
+// --------------------
+// 1) Endpoint for GoHighLevel to start outbound call
+// --------------------
 app.post('/start-call', async (req, res) => {
   try {
-    const { phone, leadId } = req.body;
+    const { phone, contact_id } = req.body;  // use contact_id from GHL webhook
     if (!phone) return res.status(400).json({ error: 'phone required' });
 
     const call = await twilioClient.calls.create({
       to: phone,
       from: TWILIO_FROM_NUMBER,
-      url: `${BASE_URL}/twilio/voice?leadId=${encodeURIComponent(leadId || '')}`
+      url: `${BASE_URL}/twilio/voice?leadId=${encodeURIComponent(contact_id || '')}`
     });
 
+    logLead(contact_id, `Outbound call started (Call SID: ${call.sid})`);
     return res.json({ success: true, callSid: call.sid });
   } catch (err) {
     console.error('start-call error', err);
@@ -50,7 +56,9 @@ app.post('/start-call', async (req, res) => {
   }
 });
 
-// -------------------- 2) Twilio Voice Webhook --------------------
+// --------------------
+// 2) Twilio voice webhook
+// --------------------
 app.post('/twilio/voice', (req, res) => {
   const leadId = req.query.leadId || 'unknown';
   const streamUrl = (BASE_URL.replace(/^http/, 'ws')) + '/stream?leadId=' + encodeURIComponent(leadId);
@@ -66,9 +74,12 @@ app.post('/twilio/voice', (req, res) => {
   </Response>`;
 
   res.type('text/xml').send(twiml);
+  logLead(leadId, 'Twilio voice webhook responded');
 });
 
-// -------------------- 3) WebSocket Server for Twilio MediaStream --------------------
+// --------------------
+// 3) WebSocket server for Twilio MediaStream
+// --------------------
 const server = app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
@@ -97,26 +108,24 @@ wss.on('connection', (ws, req) => {
         }
       }
     } catch (err) {
-      logLead(leadId, `DeepGram parse error: ${err.message}`);
+      console.error(`[Lead ${leadId}] DeepGram parse error:`, err);
     }
   });
 
   dgWs.on('close', () => logLead(leadId, 'DeepGram WebSocket closed'));
-  dgWs.on('error', (err) => logLead(leadId, `DeepGram error: ${err.message}`));
+  dgWs.on('error', (err) => console.error(`[Lead ${leadId}] DeepGram error:`, err));
 
-  // Handle Twilio messages
+  // Handle Twilio MediaStream messages
   ws.on('message', (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-      if (data.event === 'media') {
-        const payload = data.media.payload;
+      if (data.event === 'media' && dgWs.readyState === WebSocket.OPEN) {
+        const payload = Buffer.from(data.media.payload, 'base64');
+        dgWs.send(payload);
         logLead(leadId, `Sending audio to DeepGram: ${payload.length} bytes`);
-        if (dgWs && dgWs.readyState === WebSocket.OPEN) {
-          dgWs.send(Buffer.from(payload, 'base64'));
-        }
       }
-    } catch (e) {
-      logLead(leadId, `ws parse error: ${e.message}`);
+    } catch (err) {
+      console.debug(`[Lead ${leadId}] WS parse error:`, err);
     }
   });
 
