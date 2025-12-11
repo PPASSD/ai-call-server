@@ -4,41 +4,63 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
 const http = require('http');
+const twilio = require('twilio');
+const fetch = require('node-fetch'); // for ElevenLabs API
 
 const app = express();
 const port = process.env.PORT || 10000;
+
+// Twilio client
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 app.use(bodyParser.json());
 
 // Map to track CallSid -> leadId
 const callMap = {};
 
-// Twilio Voice webhook: receive outbound call request from GoHighLevel
-app.post('/twilio-voice-webhook', (req, res) => {
-  const { contact_id, phone, name, CallSid } = req.body;
+// ========== 1. Endpoint to trigger outbound call ==========
+app.post('/call-lead', async (req, res) => {
+  const { phone, contact_id, name } = req.body;
 
-  // Store mapping
-  if (CallSid && contact_id) {
-    callMap[CallSid] = contact_id;
-    console.log(`[Lead ${contact_id}] Twilio voice webhook received. CallSid: ${CallSid}`);
-  } else {
-    console.log(`[Lead unknown] Twilio voice webhook received without lead info`);
+  try {
+    const call = await client.calls.create({
+      to: phone,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      url: `${process.env.SERVER_URL}/twilio-voice-webhook?contact_id=${contact_id}&name=${encodeURIComponent(name)}`
+    });
+
+    callMap[call.sid] = contact_id;
+    console.log(`[Lead ${contact_id}] Outbound call started: ${call.sid}`);
+    res.json({ success: true, callSid: call.sid });
+  } catch (err) {
+    console.error(`[Lead ${contact_id}] Error starting call:`, err.message);
+    res.status(500).json({ error: err.message });
   }
+});
 
-  // Respond with TwiML
+// ========== 2. Twilio Voice Webhook (TwiML) ==========
+app.post('/twilio-voice-webhook', (req, res) => {
+  const { contact_id, name } = req.query;
+  const CallSid = req.body.CallSid || req.query.CallSid;
+
+  if (CallSid && contact_id) callMap[CallSid] = contact_id;
+
+  console.log(`[Lead ${contact_id || 'unknown'}] Twilio webhook invoked. CallSid: ${CallSid}`);
+
   const twiml = `
     <Response>
       <Start>
         <Stream url="wss://${req.headers.host}/stream?callSid=${CallSid}" />
       </Start>
-      <Say>Hello, this is your AI assistant.</Say>
+      <Say>Hello, this is your AI assistant. Please wait while I connect.</Say>
     </Response>
   `;
+
   res.type('text/xml');
   res.send(twiml);
 });
 
-// Create HTTP server and WebSocket server
+// ========== 3. HTTP + WebSocket Setup ==========
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -55,26 +77,47 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
-// Handle incoming WebSocket connections (Twilio MediaStream)
+// ========== 4. Handle Twilio MediaStream ==========
 wss.on('connection', (ws) => {
   console.log(`[Lead ${ws.leadId}] Twilio MediaStream connected`);
 
-  ws.on('message', (message) => {
-    // For simplicity, log the size of audio chunks
-    console.log(`[Lead ${ws.leadId}] Sending audio to DeepGram: ${message.length} bytes`);
+  ws.on('message', async (message) => {
+    // Log audio chunk size
+    console.log(`[Lead ${ws.leadId}] Audio chunk received: ${message.length} bytes`);
 
-    // TODO: Send audio to DeepGram WebSocket here
-    // TODO: Receive AI response and send to ElevenLabs TTS if needed
+    // TODO: Send audio to DeepGram WebSocket
+    // Placeholder: transcribe audio
+    // const transcription = await sendAudioToDeepGram(message);
+
+    // TODO: Generate AI response
+    // const aiResponse = await generateAIResponse(transcription);
+
+    // TODO: Send AI response to ElevenLabs TTS
+    // const ttsAudio = await elevenLabsTTS(aiResponse);
+
+    // TODO: Send TTS back to Twilio call
+    // ws.send(ttsAudio);
   });
 
   ws.on('close', () => {
     console.log(`[Lead ${ws.leadId}] Twilio MediaStream disconnected`);
-    // Cleanup mapping
     if (ws.callSid) delete callMap[ws.callSid];
   });
 });
 
-// Start server
+// ========== 5. Placeholder functions for DeepGram & ElevenLabs ==========
+async function sendAudioToDeepGram(audioBuffer) {
+  // Implement DeepGram streaming API
+}
+
+async function generateAIResponse(transcription) {
+  // Implement AI model (OpenAI GPT) response
+}
+
+async function elevenLabsTTS(text) {
+  // Implement TTS using ElevenLabs API
+}
+
 server.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
