@@ -22,7 +22,10 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_KEY;
 const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE || 'vBKc2FfBKJfcZNyEt1n6';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || 'ai-call-server-zqvh.onrender.com';
 
-// In-memory mapping phone -> lead info
+// ========================
+// In-memory call mapping
+// phone -> lead info
+// ========================
 const callMap = {};
 
 // ========================
@@ -32,7 +35,7 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 // -------------------
-// Sanitize phone number
+// Phone sanitizer
 // -------------------
 function sanitizePhone(raw) {
   if (!raw) return null;
@@ -44,34 +47,36 @@ function sanitizePhone(raw) {
   return '+' + s;
 }
 
-// -------------------
+// ========================
 // Twilio Voice Webhook
-// -------------------
+// ========================
 app.post('/twilio-voice-webhook', (req, res) => {
   const phone = req.query.phone || 'unknown';
   callMap[phone] = callMap[phone] || { phone };
 
-  console.log('[twilio-voice-webhook] phone:', phone);
-
   const twiml = `
-    <Response>
-      <Start>
-        <Stream url="wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}" />
-      </Start>
-      <Say voice="alice">Hi, connecting you now.</Say>
-    </Response>
+<Response>
+  <Start>
+    <Stream url="wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}" />
+  </Start>
+  <Say voice="alice">Hi, connecting you now.</Say>
+</Response>
   `;
 
+  console.log('[twilio-voice-webhook] phone:', phone);
   res.type('text/xml').send(twiml);
 });
 
-// -------------------
+// ========================
 // GHL webhook: /start-call
-// -------------------
+// ========================
 app.post('/start-call', async (req, res) => {
   console.log('[start-call] Payload:', req.body);
+
   const phone = sanitizePhone(req.body.phone);
   const name = req.body.name || 'Unknown';
+  const email = req.body.email || '';
+  const source = req.body.source || '';
 
   if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone' });
 
@@ -87,8 +92,9 @@ app.post('/start-call', async (req, res) => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       }
     );
-    callMap[phone] = { phone, name };
-    console.log(`[start-call] Twilio call created: ${twilioRes.data.sid}`);
+
+    callMap[phone] = { phone, name, email, source };
+    console.log('[start-call] Twilio call created:', twilioRes.data.sid);
     res.json({ success: true, callSid: twilioRes.data.sid });
   } catch (err) {
     console.error('[start-call] Twilio error:', err.response?.data || err.message);
@@ -117,9 +123,9 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
-// -------------------
+// ========================
 // ElevenLabs TTS Helper
-// -------------------
+// ========================
 async function elevenLabsTTSBuffer(text) {
   if (!text) return null;
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
@@ -132,9 +138,9 @@ async function elevenLabsTTSBuffer(text) {
   return Buffer.from(resp.data);
 }
 
-// -------------------
+// ========================
 // Gemini 2.5 Flash-lite Helper
-// -------------------
+// ========================
 function createGeminiWS(onChunk, onClose) {
   const geminiUrl = `wss://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=${GEMINI_API_KEY}`;
   const gws = new WebSocket(geminiUrl);
@@ -150,18 +156,21 @@ function createGeminiWS(onChunk, onClose) {
       console.error('[Gemini] parse error', err.message);
     }
   });
-  gws.on('close', () => { console.log('[Gemini] closed'); if (onClose) onClose(); });
-  gws.on('error', (err) => console.error('[Gemini] error', err.message));
+  gws.on('close', (code, reason) => {
+    console.log(`[Gemini] closed: code=${code} reason=${reason}`);
+    if (onClose) onClose();
+  });
+  gws.on('error', (err) => console.error('[Gemini] WS error', err.message));
   return gws;
 }
 
-// -------------------
+// ========================
 // Twilio WS Connection: MediaStream -> DeepGram -> Gemini -> ElevenLabs -> Twilio
-// -------------------
+// ========================
 wss.on('connection', (ws) => {
   const phone = ws.phone;
   const lead = ws.leadInfo;
-  console.log(`[WS] MediaStream connected: phone=${phone}`);
+  console.log(`[WS] MediaStream connected: phone=${phone}`, lead);
 
   // DeepGram WS
   const dgWS = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova&language=en-US', {
@@ -169,14 +178,12 @@ wss.on('connection', (ws) => {
   });
 
   dgWS.on('open', () => console.log(`[DeepGram] WS open for phone=${phone}`));
-
   dgWS.on('message', async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
       if (data.type === 'transcript') {
         const transcript = data.channel.alternatives[0].transcript;
         console.log(`[DeepGram][${phone}] transcript:`, transcript);
-
         if (transcript.trim() !== '' && geminiWS.readyState === WebSocket.OPEN) {
           geminiWS.send(JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: transcript }] }],
@@ -188,7 +195,6 @@ wss.on('connection', (ws) => {
       console.error('[DeepGram WS] parse error', err.message);
     }
   });
-
   dgWS.on('error', (err) => console.error('[DeepGram WS] error', err.message));
   dgWS.on('close', () => console.log(`[DeepGram] WS closed for phone=${phone}`));
 
@@ -197,7 +203,6 @@ wss.on('connection', (ws) => {
     console.log(`[Gemini->Reply][${phone}]`, replyChunk);
     const ttsBuffer = await elevenLabsTTSBuffer(replyChunk);
     if (!ttsBuffer) return;
-
     const base64Audio = ttsBuffer.toString('base64');
     ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }));
   }, () => { try { geminiWS.close(); } catch (e) {} });
@@ -222,7 +227,7 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error(`[WS] error: ${err.message}`));
 });
 
-// -------------------
-// Start server
-// -------------------
+// ========================
+// Start Server
+// ========================
 server.listen(port, () => console.log(`AI Call Server listening on port ${port}`));
