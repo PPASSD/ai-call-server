@@ -63,6 +63,18 @@ function sanitizePhone(raw) {
 app.get('/test', (req, res) => res.json({ status: 'Server running' }));
 
 // -------------------
+// Helper: Escape XML
+// -------------------
+function escapeXml(unsafe) {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// -------------------
 // Twilio Voice Webhook
 // -------------------
 app.post('/twilio-voice-webhook', (req, res) => {
@@ -71,18 +83,22 @@ app.post('/twilio-voice-webhook', (req, res) => {
     const phone = req.query.phone || 'unknown';
     callMap[callSid] = callMap[callSid] || { phone };
 
+    // Construct safe URL
+    const streamUrl = `wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}&callSid=${encodeURIComponent(callSid)}`;
+    
     const twiml = `
       <Response>
         <Start>
-          <Stream url="wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}&callSid=${callSid}" />
+          <Stream url="${escapeXml(streamUrl)}" />
         </Start>
         <Say voice="alice">Hi, connecting you now.</Say>
       </Response>
     `;
+
     console.log('[twilio-voice-webhook] callSid:', callSid, 'phone:', phone);
     res.type('text/xml').send(twiml);
   } catch (err) {
-    console.error('[twilio-voice-webhook] error:', err);
+    console.error('[twilio-voice-webhook] error:', err.message);
     res.status(500).send('<Response><Say>There was an error. Goodbye.</Say></Response>');
   }
 });
