@@ -25,9 +25,9 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 
 // Validate required ENV variables
 const requiredEnvs = [
-  'PUBLIC_HOST', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN',
-  'TWILIO_NUMBER', 'DG_API_KEY', 'GEMINI_API_KEY', 
-  'ELEVENLABS_KEY', 'ELEVENLABS_VOICE', 'GCP_PROJECT_ID', 'GEMINI_MODEL'
+  'PUBLIC_HOST','TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN',
+  'TWILIO_NUMBER','DG_API_KEY','GEMINI_API_KEY',
+  'ELEVENLABS_KEY','ELEVENLABS_VOICE','GCP_PROJECT_ID','GEMINI_MODEL'
 ];
 const missingEnvs = requiredEnvs.filter(v => !process.env[v]);
 if (missingEnvs.length > 0) {
@@ -58,7 +58,12 @@ function sanitizePhone(raw) {
 }
 
 // -------------------
-// Escape XML for Twilio
+// Healthcheck
+// -------------------
+app.get('/test', (req, res) => res.json({ status: 'Server running' }));
+
+// -------------------
+// Helper: Escape XML
 // -------------------
 function escapeXml(unsafe) {
   return unsafe
@@ -70,57 +75,48 @@ function escapeXml(unsafe) {
 }
 
 // -------------------
-// Healthcheck
-// -------------------
-app.get('/test', (req, res) => res.json({ status: 'Server running' }));
-
-// -------------------
 // Twilio Voice Webhook
 // -------------------
 app.post('/twilio-voice-webhook', (req, res) => {
   try {
     const callSid = req.body.CallSid || req.body.callSid;
     const phone = req.query.phone || 'unknown';
-    callMap[callSid] = callMap[callSid] || { phone, status: 'incoming' };
+    callMap[callSid] = callMap[callSid] || { phone };
 
-    console.log(`[Twilio Webhook] Incoming call callSid=${callSid}, phone=${phone}`);
-
-    const streamUrl = `wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}&callSid=${encodeURIComponent(callSid)}`;
-
+    // Construct safe URL for streaming
+    const streamUrl = `wss://${PUBLIC_HOST}/stream`;
+    
     const twiml = `
       <Response>
         <Start>
           <Stream url="${escapeXml(streamUrl)}" />
         </Start>
-        <Say voice="alice">Hi ${escapeXml(phone)}, connecting you now.</Say>
+        <Say voice="alice">Hi, connecting you now.</Say>
       </Response>
     `;
 
-    console.log(`[Twilio Webhook] Returning TwiML for callSid=${callSid}`);
+    console.log('[Twilio Webhook] Incoming call callSid=' + callSid + ', phone=' + phone);
+    console.log('[Twilio Webhook] Returning TwiML for callSid=' + callSid);
     res.type('text/xml').send(twiml);
   } catch (err) {
-    console.error('[Twilio Webhook] Error:', err.message);
+    console.error('[Twilio Webhook] error:', err.message);
     res.status(500).send('<Response><Say>There was an error. Goodbye.</Say></Response>');
   }
 });
 
 // -------------------
-// GHL Webhook: /start-call
+// GHL webhook: /start-call
 // -------------------
 app.post('/start-call', async (req, res) => {
+  console.log('[Start-Call] Payload received:', req.body);
+  const phone = sanitizePhone(req.body.phone);
+  const name = req.body.name || 'Unknown';
+  if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone' });
+
+  const twilioWebhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
+  const params = new URLSearchParams({ To: phone, From: TWILIO_NUMBER, Url: twilioWebhookUrl });
+
   try {
-    const payload = req.body;
-    console.log('[Start-Call] Payload received:', payload);
-
-    const phone = sanitizePhone(payload.phone);
-    const name = payload.name || 'Unknown';
-    if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone' });
-
-    const twilioWebhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
-    const params = new URLSearchParams({ To: phone, From: TWILIO_NUMBER, Url: twilioWebhookUrl });
-
-    console.log(`[Start-Call] Creating Twilio call to ${phone} using webhook ${twilioWebhookUrl}`);
-
     const twilioRes = await axios.post(
       `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls.json`,
       params.toString(),
@@ -129,13 +125,11 @@ app.post('/start-call', async (req, res) => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       }
     );
-
-    callMap[twilioRes.data.sid] = { phone, name, status: 'outbound' };
+    callMap[twilioRes.data.sid] = { phone, name };
     console.log('[Start-Call] Twilio call created:', twilioRes.data.sid);
-
     res.json({ success: true, callSid: twilioRes.data.sid });
   } catch (err) {
-    console.error('[Start-Call] Twilio API error:', err.response?.data || err.message);
+    console.error('[Start-Call] Twilio error:', err.response?.data || err.message);
     res.status(500).json({ success: false, error: err.response?.data || err.message });
   }
 });
@@ -147,14 +141,15 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 // -------------------
-// Handle WS Upgrade
+// WebSocket Upgrade
 // -------------------
 server.on('upgrade', (request, socket, head) => {
   try {
-    const url = new URL(request.url, `https://${request.headers.host}`);
-    const pathname = url.pathname;
-    const callSid = url.searchParams.get('callSid') || 'unknown';
-    const phone = url.searchParams.get('phone') || 'unknown';
+    const pathname = new URL(request.url, `https://${request.headers.host}`).pathname;
+
+    // Twilio passes callSid in headers
+    const callSid = request.headers['x-twilio-callsid'] || 'unknown';
+    const phone = request.headers['x-twilio-from'] || 'unknown';
     console.log('[WS Upgrade] Path:', pathname, 'callSid:', callSid, 'phone:', phone);
 
     if (pathname === '/stream') {
@@ -176,7 +171,7 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 // -------------------
-// ElevenLabs TTS
+// ElevenLabs TTS Helper
 // -------------------
 async function elevenLabsTTSBuffer(text) {
   try {
@@ -223,7 +218,7 @@ function createGeminiWS(onChunk, onClose) {
 }
 
 // -------------------
-// WebSocket Stream: Twilio -> DeepGram -> Gemini -> ElevenLabs
+// WebSocket Connection: Twilio -> DeepGram -> Gemini -> ElevenLabs -> Twilio
 // -------------------
 wss.on('connection', (ws) => {
   const callSid = ws.callSid;
@@ -275,7 +270,7 @@ wss.on('connection', (ws) => {
         dgWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
       }
     } catch (err) {
-      console.error('[WS message parse] error:', err.message);
+      console.error(`[WS message][${callSid}] parse error:`, err.message);
     }
   });
 
