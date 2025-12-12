@@ -130,21 +130,30 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 // -------------------
-// Handle Twilio MediaStream WS Upgrade
+// Handle Twilio MediaStream WS explicitly at /stream
 // -------------------
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `https://${request.headers.host}`);
+  const pathname = url.pathname;
   const callSid = url.searchParams.get('callSid') || 'unknown';
   const phone = url.searchParams.get('phone') || 'unknown';
   const leadInfo = callMap[callSid] || { phone };
 
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    ws.callSid = callSid;
-    ws.phone = phone;
-    ws.leadInfo = leadInfo;
-    wss.emit('connection', ws, request);
-  });
+  console.log('[WS Upgrade] Path:', pathname, 'callSid:', callSid, 'phone:', phone);
+
+  if (pathname === '/stream') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      ws.callSid = callSid;
+      ws.phone = phone;
+      ws.leadInfo = leadInfo;
+      console.log(`[WS] New connection for callSid=${callSid}`);
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy(); // reject other WS paths
+  }
 });
+
 
 // -------------------
 // ElevenLabs TTS Helper
