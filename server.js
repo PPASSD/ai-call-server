@@ -22,7 +22,7 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_KEY;
 const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE || 'vBKc2FfBKJfcZNyEt1n6';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || 'ai-call-server-zqvh.onrender.com';
 
-// In-memory mapping callSid -> lead info
+// In-memory mapping: phone -> call info
 const callMap = {};
 
 // ========================
@@ -40,31 +40,24 @@ function sanitizePhone(raw) {
   s = s.replace(/\D/g, '');
   if (s.length === 10) s = '1' + s;
   if (s.length === 11 && s.startsWith('1')) return '+' + s;
-  return null;
+  return '+' + s;
 }
 
 // ========================
-// 1️⃣ GHL Webhook: Start Call
+// GoHighLevel webhook endpoint: /start-call
 // ========================
 app.post('/start-call', async (req, res) => {
-  console.log('[start-call] Payload:', req.body);
-
   const phone = sanitizePhone(req.body.phone);
   const name = req.body.name || 'Unknown';
-  const contact_id = req.body.contact_id || 'unknown';
+  const email = req.body.email || 'unknown';
+  const source = req.body.source || 'unknown';
 
-  if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone number' });
+  if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone' });
+
+  const twilioWebhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
+  const params = new URLSearchParams({ To: phone, From: TWILIO_NUMBER, Url: twilioWebhookUrl });
 
   try {
-    // Twilio webhook URL for the call
-    const twilioWebhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?contact_id=${encodeURIComponent(contact_id)}`;
-
-    const params = new URLSearchParams({
-      To: phone,
-      From: TWILIO_NUMBER,
-      Url: twilioWebhookUrl
-    });
-
     const twilioRes = await axios.post(
       `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Calls.json`,
       params.toString(),
@@ -74,10 +67,8 @@ app.post('/start-call', async (req, res) => {
       }
     );
 
-    // Save info for later WS mapping
-    callMap[twilioRes.data.sid] = { contact_id, phone, name };
-    console.log(`[start-call] Twilio call created: ${twilioRes.data.sid}`);
-
+    callMap[phone] = { callSid: twilioRes.data.sid, name, email, source };
+    console.log(`[start-call] Call created for ${phone}: ${twilioRes.data.sid}`);
     res.json({ success: true, callSid: twilioRes.data.sid });
   } catch (err) {
     console.error('[start-call] Twilio error:', err.response?.data || err.message);
@@ -86,52 +77,44 @@ app.post('/start-call', async (req, res) => {
 });
 
 // ========================
-// 2️⃣ Twilio Voice Webhook: Return TwiML for MediaStream
+// Twilio Voice Webhook: /twilio-voice-webhook
 // ========================
 app.post('/twilio-voice-webhook', (req, res) => {
-  const CallSid = req.body.CallSid;
-  const contact_id = req.query.contact_id || 'unknown';
-
-  console.log('[twilio-voice-webhook] CallSid:', CallSid, 'contact_id:', contact_id);
-
-  // Map the callSid to contact info if not already mapped
-  callMap[CallSid] = callMap[CallSid] || { contact_id };
+  const phone = req.query.phone;
+  const info = callMap[phone] || { name: 'Unknown' };
 
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://${PUBLIC_HOST}/stream?callSid=${CallSid}" />
+        <Stream url="wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}" />
       </Start>
-      <Say voice="alice">Hi, connecting you now.</Say>
+      <Say voice="alice">Hi ${info.name}, connecting you now.</Say>
     </Response>
   `;
   res.type('text/xml').send(twiml);
 });
 
 // ========================
-// 3️⃣ HTTP + WebSocket Server
+// HTTP + WebSocket Server
 // ========================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-// -------------------
-// Handle Twilio MediaStream WS Upgrade
-// -------------------
 server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `https://${request.headers.host}`);
-  const callSid = url.searchParams.get('callSid');
-  const leadInfo = callMap[callSid] || { contact_id: 'unknown' };
+  const phone = url.searchParams.get('phone');
+  const callInfo = callMap[phone] || { name: 'Unknown' };
 
   wss.handleUpgrade(request, socket, head, (ws) => {
-    ws.callSid = callSid;
-    ws.leadInfo = leadInfo;
+    ws.phone = phone;
+    ws.callInfo = callInfo;
     wss.emit('connection', ws, request);
   });
 });
 
-// -------------------
+// ========================
 // ElevenLabs TTS Helper
-// -------------------
+// ========================
 async function elevenLabsTTSBuffer(text) {
   if (!text) return null;
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
@@ -144,9 +127,9 @@ async function elevenLabsTTSBuffer(text) {
   return Buffer.from(resp.data);
 }
 
-// -------------------
+// ========================
 // Gemini WS Helper
-// -------------------
+// ========================
 function createGeminiWS(onChunk, onClose) {
   const geminiUrl = `wss://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=${GEMINI_API_KEY}`;
   const gws = new WebSocket(geminiUrl);
@@ -167,28 +150,32 @@ function createGeminiWS(onChunk, onClose) {
   return gws;
 }
 
-// -------------------
-// WS Connection: Twilio MediaStream -> DeepGram -> Gemini -> ElevenLabs -> Twilio
-// -------------------
+// ========================
+// Twilio MediaStream WS Handler
+// ========================
 wss.on('connection', (ws) => {
-  const callSid = ws.callSid;
-  const lead = ws.leadInfo;
-  console.log(`[WS] MediaStream connected: callSid=${callSid}`, lead);
+  const phone = ws.phone;
+  const info = ws.callInfo;
+  console.log(`[WS] MediaStream connected for phone=${phone}`);
 
-  // DeepGram WS
   const dgWS = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova&language=en-US', {
     headers: { Authorization: `Token ${DG_API_KEY}` }
   });
 
-  dgWS.on('open', () => console.log(`[DeepGram] WS open for callSid=${callSid}`));
+  dgWS.on('open', () => console.log(`[DeepGram] WS open for phone=${phone}`));
 
-  dgWS.on('message', async (msg) => {
+  const geminiWS = createGeminiWS(async (replyChunk) => {
+    const ttsBuffer = await elevenLabsTTSBuffer(replyChunk);
+    if (!ttsBuffer) return;
+    const base64Audio = ttsBuffer.toString('base64');
+    ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }));
+  });
+
+  dgWS.on('message', (msg) => {
     try {
       const data = JSON.parse(msg.toString());
       if (data.type === 'transcript') {
         const transcript = data.channel.alternatives[0].transcript;
-        console.log(`[DeepGram][${callSid}] transcript:`, transcript);
-
         if (transcript.trim() !== '' && geminiWS.readyState === WebSocket.OPEN) {
           geminiWS.send(JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: transcript }] }],
@@ -201,20 +188,6 @@ wss.on('connection', (ws) => {
     }
   });
 
-  dgWS.on('error', (err) => console.error('[DeepGram WS] error', err.message));
-  dgWS.on('close', () => console.log(`[DeepGram] WS closed for callSid=${callSid}`));
-
-  // Gemini WS
-  const geminiWS = createGeminiWS(async (replyChunk) => {
-    console.log(`[Gemini->Reply][${callSid}]`, replyChunk);
-    const ttsBuffer = await elevenLabsTTSBuffer(replyChunk);
-    if (!ttsBuffer) return;
-
-    const base64Audio = ttsBuffer.toString('base64');
-    ws.send(JSON.stringify({ event: 'media', media: { payload: base64Audio } }));
-  }, () => { try { geminiWS.close(); } catch (e) {} });
-
-  // Twilio MediaStream -> DeepGram
   ws.on('message', (msg) => {
     const data = JSON.parse(msg.toString());
     if (data.event === 'media' && data.media?.payload && dgWS.readyState === WebSocket.OPEN) {
@@ -225,16 +198,13 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log(`[WS] Twilio stream closed: ${callSid}`);
+    console.log(`[WS] Twilio stream closed for phone=${phone}`);
     if (dgWS.readyState === WebSocket.OPEN) dgWS.close();
     if (geminiWS.readyState === WebSocket.OPEN) geminiWS.close();
-    delete callMap[callSid];
+    delete callMap[phone];
   });
 
   ws.on('error', (err) => console.error(`[WS] error: ${err.message}`));
 });
 
-// ========================
-// Start Server
-// ========================
 server.listen(port, () => console.log(`AI Call Server listening on port ${port}`));
