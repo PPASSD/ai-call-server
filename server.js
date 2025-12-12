@@ -357,3 +357,37 @@ wss.on('connection', (ws, req) => {
               } else {
                 console.warn('[Gemini] not open; cannot send transcript');
               }
+            }
+          } catch (err) {
+            console.error('[DeepGram] error:', err.response?.data || err.message);
+          }
+        }
+      } else if (data.event === 'stop') {
+        console.log(`[WS ${callSid}] Twilio stream stopped`);
+      } else {
+        // Other events we can ignore or log
+        // console.log('WS other event:', data.event);
+      }
+    } catch (err) {
+      console.error('[WS] message handler error:', err.message);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[WS] connection closed for callSid=${callSid}`);
+    try {
+      if (geminiWS && geminiWS.readyState === WebSocket.OPEN) geminiWS.close();
+    } catch (e) {}
+    if (callSid && callMap[callSid]) delete callMap[callSid];
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[WS] connection error for callSid=${callSid}:`, err.message);
+  });
+});
+
+// start server
+server.listen(port, () => {
+  console.log(`AI Call Server listening on port ${port}`);
+  console.log(`PUBLIC_HOST=${PUBLIC_HOST}`);
+});
