@@ -18,16 +18,15 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 const DG_API_KEY = process.env.DG_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL;
 const ELEVENLABS_KEY = process.env.ELEVENLABS_KEY;
 const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE;
 const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID;
-const GEMINI_MODEL = process.env.GEMINI_MODEL;
 
 // Validate required ENV variables
 const requiredEnvs = [
-  'PUBLIC_HOST','TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN',
-  'TWILIO_NUMBER','DG_API_KEY','GEMINI_API_KEY',
-  'ELEVENLABS_KEY','ELEVENLABS_VOICE','GCP_PROJECT_ID','GEMINI_MODEL'
+  'PUBLIC_HOST', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_NUMBER',
+  'DG_API_KEY', 'GEMINI_API_KEY', 'GEMINI_MODEL', 'ELEVENLABS_KEY', 'ELEVENLABS_VOICE', 'GCP_PROJECT_ID'
 ];
 const missingEnvs = requiredEnvs.filter(v => !process.env[v]);
 if (missingEnvs.length > 0) {
@@ -58,7 +57,7 @@ function sanitizePhone(raw) {
 }
 
 // -------------------
-// Healthcheck
+// Healthcheck route
 // -------------------
 app.get('/test', (req, res) => res.json({ status: 'Server running' }));
 
@@ -83,9 +82,8 @@ app.post('/twilio-voice-webhook', (req, res) => {
     const phone = req.query.phone || 'unknown';
     callMap[callSid] = callMap[callSid] || { phone };
 
-    // Construct safe URL for streaming
-    const streamUrl = `wss://${PUBLIC_HOST}/stream`;
-    
+    const streamUrl = `wss://${PUBLIC_HOST}/stream?phone=${encodeURIComponent(phone)}&callSid=${encodeURIComponent(callSid)}`;
+
     const twiml = `
       <Response>
         <Start>
@@ -108,9 +106,11 @@ app.post('/twilio-voice-webhook', (req, res) => {
 // GHL webhook: /start-call
 // -------------------
 app.post('/start-call', async (req, res) => {
-  console.log('[Start-Call] Payload received:', req.body);
-  const phone = sanitizePhone(req.body.phone);
-  const name = req.body.name || 'Unknown';
+  const payload = req.body;
+  console.log('[Start-Call] Payload received:', payload);
+
+  const phone = sanitizePhone(payload.phone);
+  const name = payload.name || 'Unknown';
   if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone' });
 
   const twilioWebhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
@@ -125,6 +125,7 @@ app.post('/start-call', async (req, res) => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       }
     );
+
     callMap[twilioRes.data.sid] = { phone, name };
     console.log('[Start-Call] Twilio call created:', twilioRes.data.sid);
     res.json({ success: true, callSid: twilioRes.data.sid });
@@ -141,15 +142,14 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 // -------------------
-// WebSocket Upgrade
+// WS Upgrade
 // -------------------
 server.on('upgrade', (request, socket, head) => {
   try {
-    const pathname = new URL(request.url, `https://${request.headers.host}`).pathname;
-
-    // Twilio passes callSid in headers
-    const callSid = request.headers['x-twilio-callsid'] || 'unknown';
-    const phone = request.headers['x-twilio-from'] || 'unknown';
+    const url = new URL(request.url, `https://${request.headers.host}`);
+    const pathname = url.pathname;
+    const callSid = url.searchParams.get('callSid') || 'unknown';
+    const phone = url.searchParams.get('phone') || 'unknown';
     console.log('[WS Upgrade] Path:', pathname, 'callSid:', callSid, 'phone:', phone);
 
     if (pathname === '/stream') {
@@ -171,7 +171,7 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 // -------------------
-// ElevenLabs TTS Helper
+// ElevenLabs TTS
 // -------------------
 async function elevenLabsTTSBuffer(text) {
   try {
@@ -190,11 +190,11 @@ async function elevenLabsTTSBuffer(text) {
 }
 
 // -------------------
-// Gemini WS Helper
+// Gemini WS
 // -------------------
 function createGeminiWS(onChunk, onClose) {
   try {
-    const geminiUrl = `wss://generativelanguage.googleapis.com/v1beta/projects/${GCP_PROJECT_ID}/locations/us-central1/models/${GEMINI_MODEL}:streamGenerateContent?key=${GEMINI_API_KEY}`;
+    const geminiUrl = `wss://generativelanguage.googleapis.com/v1/publishers/google/models/${GEMINI_MODEL}:streamGenerateContent?key=${GEMINI_API_KEY}`;
     const gws = new WebSocket(geminiUrl);
 
     gws.on('open', () => console.log('[Gemini] connected'));
@@ -205,11 +205,11 @@ function createGeminiWS(onChunk, onClose) {
         const text = candidate?.content?.parts?.[0]?.text;
         if (text) onChunk(text);
       } catch (err) {
-        console.error('[Gemini] parse error', err.message);
+        console.error('[Gemini WS] parse error', err.message);
       }
     });
     gws.on('close', () => { console.log('[Gemini] closed'); if (onClose) onClose(); });
-    gws.on('error', (err) => console.error('[Gemini] error', err.message));
+    gws.on('error', (err) => console.error('[Gemini WS] error', err.message));
     return gws;
   } catch (err) {
     console.error('[createGeminiWS] error:', err.message);
@@ -225,19 +225,18 @@ wss.on('connection', (ws) => {
   const phone = ws.phone;
   console.log(`[WS] MediaStream connected: callSid=${callSid} phone=${phone}`);
 
-  // DeepGram WS
+  // ------------------- DeepGram WS
   const dgWS = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova&language=en-US', {
     headers: { Authorization: `Token ${DG_API_KEY}` }
   });
-
   dgWS.on('open', () => console.log(`[DeepGram] WS open for callSid=${callSid}`));
-  dgWS.on('message', async (msg) => {
+  dgWS.on('message', (msg) => {
     try {
       const data = JSON.parse(msg.toString());
       if (data.type === 'transcript') {
         const transcript = data.channel.alternatives[0].transcript;
         console.log(`[DeepGram][${callSid}] transcript:`, transcript);
-        if (transcript.trim() !== '' && geminiWS && geminiWS.readyState === WebSocket.OPEN) {
+        if (transcript.trim() !== '' && geminiWS.readyState === WebSocket.OPEN) {
           geminiWS.send(JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: transcript }] }],
             generationConfig: { maxOutputTokens: 180, temperature: 0.35, topP: 0.9 }
@@ -251,7 +250,7 @@ wss.on('connection', (ws) => {
   dgWS.on('close', () => console.log(`[DeepGram] WS closed for callSid=${callSid}`));
   dgWS.on('error', (err) => console.error('[DeepGram WS] error', err.message));
 
-  // Gemini WS
+  // ------------------- Gemini WS
   const geminiWS = createGeminiWS(async (replyChunk) => {
     const ttsBuffer = await elevenLabsTTSBuffer(replyChunk);
     if (!ttsBuffer) return;
@@ -260,8 +259,9 @@ wss.on('connection', (ws) => {
     console.log(`[Gemini->Reply][${callSid}]`, replyChunk);
   });
 
-  // Twilio MediaStream -> DeepGram
+  // ------------------- Twilio MediaStream -> DeepGram
   ws.on('message', (msg) => {
+    console.log(`[WS][${callSid}] Received message:`, msg.toString());
     try {
       const data = JSON.parse(msg.toString());
       if (data.event === 'media' && data.media?.payload && dgWS.readyState === WebSocket.OPEN) {
@@ -270,7 +270,7 @@ wss.on('connection', (ws) => {
         dgWS.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
       }
     } catch (err) {
-      console.error(`[WS message][${callSid}] parse error:`, err.message);
+      console.error('[WS message parse] error:', err.message);
     }
   });
 
@@ -284,7 +284,7 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error(`[WS] error: ${err.message}`));
 });
 
-// -------------------
+// ========================
 // Start server
-// -------------------
+// ========================
 server.listen(port, () => console.log(`AI Call Server listening on port ${port}`));
