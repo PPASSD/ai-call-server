@@ -145,30 +145,26 @@ const wss = new WebSocket.Server({ noServer: true });
 // WS Upgrade
 // -------------------
 server.on('upgrade', (request, socket, head) => {
-  try {
-    const url = new URL(request.url, `https://${request.headers.host}`);
-    const pathname = url.pathname;
-    const callSid = url.searchParams.get('callSid') || 'unknown';
-    const phone = url.searchParams.get('phone') || 'unknown';
-    console.log('[WS Upgrade] Path:', pathname, 'callSid:', callSid, 'phone:', phone);
+  const url = new URL(request.url, `https://${request.headers.host}`);
+  const pathname = url.pathname;
+  const callSid = url.searchParams.get('callSid');
+  const phone = url.searchParams.get('phone');
 
-    if (pathname === '/stream') {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        ws.callSid = callSid;
-        ws.phone = phone;
-        ws.leadInfo = callMap[callSid] || { phone };
-        console.log(`[WS] Connection established for callSid=${callSid}`);
-        wss.emit('connection', ws, request);
-      });
-    } else {
-      console.warn('[WS Upgrade] Unknown path, destroying socket');
-      socket.destroy();
-    }
-  } catch (err) {
-    console.error('[WS Upgrade] error:', err.message);
+  console.log('[WS Upgrade] Path:', pathname, 'callSid:', callSid, 'phone:', phone);
+
+  if (pathname === '/stream') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      ws.callSid = callSid;
+      ws.phone = phone;
+      ws.leadInfo = callMap[callSid] || { phone };
+      console.log(`[WS] Connection established for callSid=${callSid}`);
+      wss.emit('connection', ws, request);
+    });
+  } else {
     socket.destroy();
   }
 });
+
 
 // -------------------
 // ElevenLabs TTS
