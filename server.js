@@ -4,8 +4,6 @@ const bodyParser = require('body-parser');
 const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
-const { URLSearchParams } = require('url');
-const fs = require('fs');
 const { spawn } = require('child_process');
 
 const app = express();
@@ -31,7 +29,8 @@ console.log('[BOOT] Gemini model:', GEMINI_MODEL);
 /* ========================
    In-memory call store
 ======================== */
-const callMap = {};
+const callMap = {}; // store info per call
+const conversationMemory = {}; // multi-turn memory
 
 /* ========================
    Express
@@ -57,11 +56,8 @@ function escapeXml(str) {
 }
 
 function safeSend(ws, payload) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload));
-  } else {
-    console.warn('[WS] Tried to send but socket not OPEN');
-  }
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  else console.warn('[WS] Tried to send but socket not OPEN');
 }
 
 // Convert ElevenLabs audio to μ-law 8kHz PCM for Twilio
@@ -94,14 +90,12 @@ async function convertToTwilioFormat(buffer) {
 ======================== */
 app.post('/twilio-voice-webhook', (req, res) => {
   const callSid = req.body.CallSid;
-  const phone = req.query.phone || 'unknown';
+  console.log('[Twilio Webhook] Incoming call:', callSid);
 
-  console.log('[Twilio Webhook] Incoming call:', callSid, phone);
+  callMap[callSid] = { startTime: Date.now() };
+  conversationMemory[callSid] = []; // init memory
 
-  callMap[callSid] = { phone };
-
-  const streamUrl =
-    `wss://${PUBLIC_HOST}/stream?callSid=${callSid}&phone=${encodeURIComponent(phone)}`;
+  const streamUrl = `wss://${PUBLIC_HOST}/stream`;
 
   const twiml = `
 <Response>
@@ -110,7 +104,6 @@ app.post('/twilio-voice-webhook', (req, res) => {
   </Start>
   <Say>Hi, connecting you now.</Say>
 </Response>`;
-
   res.type('text/xml').send(twiml);
 });
 
@@ -121,8 +114,7 @@ app.post('/start-call', async (req, res) => {
   console.log('[Start-Call] Payload received:', req.body);
 
   const phone = sanitizePhone(req.body.phone);
-  const webhookUrl =
-    `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
+  const webhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook`;
 
   try {
     const params = new URLSearchParams({
@@ -135,10 +127,7 @@ app.post('/start-call', async (req, res) => {
       `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
       params.toString(),
       {
-        auth: {
-          username: TWILIO_ACCOUNT_SID,
-          password: TWILIO_AUTH_TOKEN
-        },
+        auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       }
     );
@@ -162,31 +151,22 @@ server.on('upgrade', (req, socket, head) => {
   if (url.pathname !== '/stream') return socket.destroy();
 
   wss.handleUpgrade(req, socket, head, ws => {
-    ws.callSid = url.searchParams.get('callSid');
-    ws.phone = url.searchParams.get('phone');
-    console.log('[WS Upgrade]', ws.callSid, ws.phone);
+    console.log('[WS Upgrade] New connection');
     wss.emit('connection', ws);
   });
 });
 
 /* ========================
-   GEMINI (HTTP)
+   GEMINI
 ======================== */
-async function callGemini(prompt) {
+async function callGemini(prompt, memory=[]) {
   console.log('[Gemini] Prompt:', prompt);
-
   try {
     const resp = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
-      {
-        contents: [{ role: 'user', parts: [{ text: prompt }] }]
-      },
-      {
-        params: { key: GEMINI_API_KEY },
-        headers: { 'Content-Type': 'application/json' }
-      }
+      { contents: [...memory.map(m => ({ role: 'user', parts: [{ text: m }] })), { role: 'user', parts: [{ text: prompt }] }] },
+      { params: { key: GEMINI_API_KEY }, headers: { 'Content-Type': 'application/json' } }
     );
-
     return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
   } catch (err) {
     console.error('[Gemini] ERROR:', err.response?.data || err.message);
@@ -195,17 +175,14 @@ async function callGemini(prompt) {
 }
 
 /* ========================
-   ELEVENLABS
+   ELEVENLABS TTS
 ======================== */
 async function tts(text) {
   console.log('[TTS] Generating audio');
   const r = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
     { text },
-    {
-      headers: { 'xi-api-key': ELEVENLABS_KEY },
-      responseType: 'arraybuffer'
-    }
+    { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
   );
   return Buffer.from(r.data);
 }
@@ -214,9 +191,10 @@ async function tts(text) {
    WS CONNECTION
 ======================== */
 wss.on('connection', ws => {
-  console.log('[WS] MediaStream connected:', ws.callSid);
+  console.log('[WS] MediaStream connected');
 
   let twilioReady = false;
+  let callSid = null;
 
   // -------------------
   // Deepgram setup
@@ -231,31 +209,23 @@ wss.on('connection', ws => {
   dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
     const transcript = data.channel?.alternatives?.[0]?.transcript;
-
-    if (!transcript) return;
+    if (!transcript || !callSid) return;
     console.log('[Deepgram] Transcript:', transcript);
 
-    // -------------------
-    // Gemini
-    // -------------------
-    const reply = await callGemini(transcript);
+    // append to memory
+    conversationMemory[callSid].push(transcript);
+
+    const reply = await callGemini(transcript, conversationMemory[callSid]);
     if (!reply) return;
     console.log('[Gemini Reply]:', reply);
 
-    // -------------------
-    // ElevenLabs TTS
-    // -------------------
+    conversationMemory[callSid].push(reply);
+
     const elevenAudio = await tts(reply);
     const twilioAudio = await convertToTwilioFormat(elevenAudio);
 
-    // -------------------
-    // Send back to Twilio
-    // -------------------
     if (twilioReady) {
-      safeSend(ws, {
-        event: 'media',
-        media: { payload: twilioAudio }
-      });
+      safeSend(ws, { event: 'media', media: { payload: twilioAudio } });
     }
   });
 
@@ -263,28 +233,28 @@ wss.on('connection', ws => {
     const data = JSON.parse(msg.toString());
 
     if (data.event === 'start') {
-      console.log('[Twilio] Stream started');
+      callSid = data.start.callSid;
+      console.log('[Twilio] Stream started for CallSid:', callSid);
       twilioReady = true;
       return;
     }
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
-      // send raw base64 audio to Deepgram
-      const audioBuffer = Buffer.from(data.media.payload, 'base64');
-      dg.send(audioBuffer);
+      dg.send(Buffer.from(data.media.payload, 'base64'));
     }
   });
 
   ws.on('close', () => {
-    console.log('[WS] Closed:', ws.callSid);
+    console.log('[WS CLOSED]', callSid);
     if (dg.readyState === WebSocket.OPEN) dg.close();
-    delete callMap[ws.callSid];
+    delete callMap[callSid];
+    delete conversationMemory[callSid];
   });
+
+  ws.on('error', e => console.error('[WS ERROR]', e));
 });
 
 /* ========================
-   START
+   START SERVER
 ======================== */
-server.listen(port, () =>
-  console.log(`🚀 AI Call Server running on port ${port}`)
-);
+server.listen(port, () => console.log(`🚀 AI Call Server running on port ${port}`));
