@@ -120,24 +120,33 @@ app.post('/start-call', async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
+// ========================
+// FIXED UPGRADE HANDLER
+// ========================
 server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  if (url.pathname !== '/stream') {
-    log('WS', 'Rejected upgrade', url.pathname);
-    return socket.destroy();
-  }
+  try {
+    const [path, queryString] = req.url.split('?');
+    if (path !== '/stream') {
+      log('WS', 'Rejected upgrade', path);
+      return socket.destroy();
+    }
 
-  const callSid = url.searchParams.get('callSid');
-  if (!callSid) {
-    console.error('🔥 WS upgrade missing callSid');
-    return socket.destroy();
-  }
+    const query = new URLSearchParams(queryString);
+    const callSid = query.get('callSid');
+    if (!callSid) {
+      console.error('🔥 WS upgrade missing callSid');
+      return socket.destroy();
+    }
 
-  wss.handleUpgrade(req, socket, head, ws => {
-    ws.callSid = callSid;
-    log('WS', 'Upgrade OK', ws.callSid);
-    wss.emit('connection', ws);
-  });
+    wss.handleUpgrade(req, socket, head, ws => {
+      ws.callSid = callSid;
+      log('WS', 'Upgrade OK', ws.callSid);
+      wss.emit('connection', ws);
+    });
+  } catch (err) {
+    console.error('🔥 WS upgrade error', err);
+    socket.destroy();
+  }
 });
 
 /* ========================
@@ -204,7 +213,7 @@ async function sendAudioChunks(ws, buffer) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
     }
-    await new Promise(r => setTimeout(r, 20)); // pacing for Twilio
+    await new Promise(r => setTimeout(r, 20));
   }
 }
 
