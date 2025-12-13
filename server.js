@@ -75,7 +75,6 @@ app.post('/twilio-voice-webhook', (req, res) => {
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
-  <!-- Keep call alive -->
   <Pause length="600" />
 </Response>
 `);
@@ -163,26 +162,33 @@ async function tts(text) {
 }
 
 /* ========================
-   AUDIO CONVERSION
+   AUDIO CONVERSION (RAW BUFFER)
 ======================== */
-function convert(buffer) {
+async function convertToBuffer(buffer) {
   return new Promise(resolve => {
-    const ff = spawn('ffmpeg', ['-i', 'pipe:0', '-f', 'mulaw', '-ar', '8000', '-ac', '1', 'pipe:1']);
+    const ff = spawn('ffmpeg', [
+      '-i', 'pipe:0',
+      '-f', 'mulaw',
+      '-ar', '8000',
+      '-ac', '1',
+      'pipe:1'
+    ]);
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
-    ff.on('close', () => resolve(Buffer.concat(chunks).toString('base64')));
+    ff.on('close', () => resolve(Buffer.concat(chunks)));
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
 }
 
 /* ========================
-   WS HANDLER
+   WS HANDLER (CHUNKED AUDIO STREAM)
 ======================== */
 wss.on('connection', ws => {
   const callSid = ws.callSid;
   log('WS', 'Connected', callSid);
 
+  // Deepgram setup
   const dg = new WebSocket(
     'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
@@ -191,13 +197,11 @@ wss.on('connection', ws => {
   dg.on('open', () => log('DEEPGRAM', 'Connected'));
   dg.on('error', e => console.error('🔥 DEEPGRAM ERROR', e));
 
-  // Keepalive to Deepgram
   const keepAlive = setInterval(() => {
-    if (dg.readyState === WebSocket.OPEN) {
-      dg.send(JSON.stringify({ type: 'KeepAlive' }));
-    }
+    if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: 'KeepAlive' }));
   }, 5000);
 
+  // Handle incoming Deepgram transcripts
   dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
     const transcript = data.channel?.alternatives?.[0]?.transcript;
@@ -205,36 +209,46 @@ wss.on('connection', ws => {
 
     log('DEEPGRAM', 'Transcript:', transcript);
 
-    // Non-blocking AI
+    // Non-blocking AI reply streaming
     (async () => {
       const reply = await callGemini(transcript);
       if (!reply) return;
 
-      const audio = await convert(await tts(reply));
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ event: 'media', media: { payload: audio } }));
-        log('AUDIO', 'Reply sent');
+      const ttsBuffer = await tts(reply);
+      const audioBuffer = await convertToBuffer(ttsBuffer);
+
+      const CHUNK_SIZE = 320; // 20ms μ-law chunks
+      for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+        const chunk = audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64');
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
+        }
+        await new Promise(r => setTimeout(r, 20));
       }
+      log('AUDIO', 'AI reply streamed in chunks');
     })();
   });
 
-  ws.on('message', msg => {
+  ws.on('message', async msg => {
     const data = JSON.parse(msg.toString());
     log('TWILIO', 'Event:', data.event);
 
     if (data.event === 'start') {
       log('TWILIO', 'Stream started', data.start.callSid);
 
-      // 🔥 IMMEDIATE GREETING
-      (async () => {
-        const greeting = 'Hi, this is the pool assistant. How can I help you today?';
-        const audio = await convert(await tts(greeting));
+      // Immediate greeting
+      const greetingBuffer = await tts('Hi, this is the pool assistant. How can I help you today?');
+      const audioBuffer = await convertToBuffer(greetingBuffer);
+
+      const CHUNK_SIZE = 320;
+      for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+        const chunk = audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64');
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ event: 'media', media: { payload: audio } }));
-          log('AUDIO', 'Initial greeting sent');
+          ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
         }
-      })();
-      return;
+        await new Promise(r => setTimeout(r, 20));
+      }
+      log('AUDIO', 'Initial greeting streamed in chunks');
     }
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
