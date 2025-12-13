@@ -64,9 +64,15 @@ app.post('/twilio-voice-webhook', (req, res) => {
   const callSid = req.body.CallSid;
   log('TWILIO', 'Incoming call', callSid);
 
+  if (!callSid) {
+    console.error('🔥 Missing CallSid from Twilio');
+    return res.status(400).send('Missing CallSid');
+  }
+
   memory[callSid] = [];
   const wsUrl = `wss://${PUBLIC_HOST}/stream?callSid=${callSid}`;
 
+  // TwiML response
   res.type('text/xml').send(`
 <Response>
   <Say voice="alice">
@@ -121,8 +127,14 @@ server.on('upgrade', (req, socket, head) => {
     return socket.destroy();
   }
 
+  const callSid = url.searchParams.get('callSid');
+  if (!callSid) {
+    console.error('🔥 WS upgrade missing callSid');
+    return socket.destroy();
+  }
+
   wss.handleUpgrade(req, socket, head, ws => {
-    ws.callSid = url.searchParams.get('callSid');
+    ws.callSid = callSid;
     log('WS', 'Upgrade OK', ws.callSid);
     wss.emit('connection', ws);
   });
@@ -192,21 +204,16 @@ async function sendAudioChunks(ws, buffer) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
     }
+    await new Promise(r => setTimeout(r, 20)); // pacing for Twilio
   }
 }
 
 /* ========================
-   WS HANDLER (CHUNKED AUDIO STREAM)
+   WS HANDLER
 ======================== */
 wss.on('connection', ws => {
   const callSid = ws.callSid;
   log('WS', 'Connected', callSid);
-
-  if (!callSid) {
-    console.error('🔥 WS missing callSid');
-    ws.close();
-    return;
-  }
 
   // Deepgram setup
   const dg = new WebSocket(
@@ -244,6 +251,7 @@ wss.on('connection', ws => {
     if (data.event === 'start') {
       log('TWILIO', 'Stream started', data.start.callSid);
 
+      // Immediate greeting
       const greetingBuffer = await tts('Hi, this is the pool assistant. How can I help you today?');
       await sendAudioChunks(ws, greetingBuffer);
       log('AUDIO', 'Initial greeting sent');
