@@ -154,13 +154,16 @@ async function sendAudio(ws, buffer) {
 }
 
 /* ========================
-   WS HANDLER
+   WS HANDLER (FIXED)
 ======================== */
 wss.on('connection', ws => {
   log('WS', 'Connected');
 
+  let aiSpeaking = false;
+  let lastTranscriptAt = 0;
+
   const dg = new WebSocket(
-    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000',
+    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
@@ -173,29 +176,52 @@ wss.on('connection', ws => {
       ws.callSid = data.start.callSid;
       log('TWILIO', 'Stream started', ws.callSid);
 
+      aiSpeaking = true;
       const greeting = await tts(
         'Hi, this is the pool assistant. How can I help you today?'
       );
       await sendAudio(ws, greeting);
+      aiSpeaking = false;
     }
 
-    if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
+    if (data.event === 'media' && dg.readyState === WebSocket.OPEN && !aiSpeaking) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
     }
   });
 
   dg.on('message', async msg => {
-    const transcript =
-      JSON.parse(msg.toString()).channel?.alternatives?.[0]?.transcript;
-    if (!transcript) return;
+    const data = JSON.parse(msg.toString());
 
-    log('DEEPGRAM', transcript);
+    // 🚫 Ignore interim transcripts
+    if (!data.is_final) return;
+
+    const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
+    if (!transcript || transcript.length < 4) return;
+
+    // 🚫 Ignore if AI already talking
+    if (aiSpeaking) return;
+
+    // 🚫 Simple debounce (prevents double replies)
+    const now = Date.now();
+    if (now - lastTranscriptAt < 1000) return;
+    lastTranscriptAt = now;
+
+    log('DEEPGRAM', 'FINAL:', transcript);
+
+    aiSpeaking = true;
 
     const reply = await callGemini(transcript);
-    if (!reply) return;
+    if (!reply) {
+      aiSpeaking = false;
+      return;
+    }
+
+    log('GEMINI', reply);
 
     const audio = await tts(reply);
     await sendAudio(ws, audio);
+
+    aiSpeaking = false;
   });
 
   ws.on('close', () => {
