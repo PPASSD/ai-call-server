@@ -21,9 +21,6 @@ const port = process.env.PORT || 10000;
 ======================== */
 const {
   PUBLIC_HOST,
-  TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
-  TWILIO_NUMBER,
   DG_API_KEY,
   GEMINI_API_KEY,
   GEMINI_MODEL,
@@ -53,8 +50,7 @@ app.get('/health', (_, res) => res.json({ ok: true }));
    TWILIO VOICE WEBHOOK
 ======================== */
 app.post('/twilio-voice-webhook', (req, res) => {
-  const callSid = req.body.CallSid;
-  log('TWILIO', 'Incoming call', callSid);
+  log('TWILIO', 'Incoming call', req.body.CallSid);
 
   const wsUrl = `wss://${PUBLIC_HOST}/stream`;
 
@@ -82,9 +78,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
-  if (!req.url.startsWith('/stream')) {
-    return socket.destroy();
-  }
+  if (!req.url.startsWith('/stream')) return socket.destroy();
 
   wss.handleUpgrade(req, socket, head, ws => {
     log('WS', 'Upgrade OK (waiting for start event)');
@@ -110,7 +104,7 @@ async function callGemini(text) {
 }
 
 /* ========================
-   ELEVENLABS
+   ELEVENLABS TTS
 ======================== */
 async function tts(text) {
   const r = await axios.post(
@@ -122,7 +116,7 @@ async function tts(text) {
 }
 
 /* ========================
-   AUDIO
+   AUDIO CONVERSION
 ======================== */
 async function convertToMulaw(buffer) {
   return new Promise(resolve => {
@@ -141,20 +135,35 @@ async function convertToMulaw(buffer) {
   });
 }
 
+/* ========================
+   SEND AUDIO (FIXED)
+======================== */
 async function sendAudio(ws, buffer) {
+  if (!ws.streamSid) {
+    console.error('🔥 Missing streamSid — cannot send audio');
+    return;
+  }
+
   const audio = await convertToMulaw(buffer);
+
   for (let i = 0; i < audio.length; i += 320) {
     if (ws.readyState !== WebSocket.OPEN) return;
+
     ws.send(JSON.stringify({
       event: 'media',
-      media: { payload: audio.slice(i, i + 320).toString('base64') }
+      streamSid: ws.streamSid,
+      media: {
+        payload: audio.slice(i, i + 320).toString('base64'),
+        track: 'outbound'
+      }
     }));
+
     await new Promise(r => setTimeout(r, 20));
   }
 }
 
 /* ========================
-   WS HANDLER (FIXED)
+   WS HANDLER
 ======================== */
 wss.on('connection', ws => {
   log('WS', 'Connected');
@@ -174,7 +183,9 @@ wss.on('connection', ws => {
 
     if (data.event === 'start') {
       ws.callSid = data.start.callSid;
-      log('TWILIO', 'Stream started', ws.callSid);
+      ws.streamSid = data.start.streamSid; // 🔑 REQUIRED
+
+      log('TWILIO', 'Stream started', ws.callSid, ws.streamSid);
 
       aiSpeaking = true;
       const greeting = await tts(
@@ -184,26 +195,24 @@ wss.on('connection', ws => {
       aiSpeaking = false;
     }
 
-    if (data.event === 'media' && dg.readyState === WebSocket.OPEN && !aiSpeaking) {
+    if (
+      data.event === 'media' &&
+      dg.readyState === WebSocket.OPEN &&
+      !aiSpeaking
+    ) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
     }
   });
 
   dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
-
-    // 🚫 Ignore interim transcripts
     if (!data.is_final) return;
 
     const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!transcript || transcript.length < 4) return;
+    if (!transcript || transcript.length < 3) return;
 
-    // 🚫 Ignore if AI already talking
-    if (aiSpeaking) return;
-
-    // 🚫 Simple debounce (prevents double replies)
     const now = Date.now();
-    if (now - lastTranscriptAt < 1000) return;
+    if (aiSpeaking || now - lastTranscriptAt < 800) return;
     lastTranscriptAt = now;
 
     log('DEEPGRAM', 'FINAL:', transcript);
