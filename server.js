@@ -54,6 +54,14 @@ function escapeXml(str) {
   );
 }
 
+function safeSend(ws, payload) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  } else {
+    console.warn('[WS] Tried to send but socket not OPEN');
+  }
+}
+
 /* ========================
    TWILIO VOICE WEBHOOK
 ======================== */
@@ -65,7 +73,8 @@ app.post('/twilio-voice-webhook', (req, res) => {
 
   callMap[callSid] = { phone };
 
-  const streamUrl = `wss://${PUBLIC_HOST}/stream?callSid=${callSid}&phone=${encodeURIComponent(phone)}`;
+  const streamUrl =
+    `wss://${PUBLIC_HOST}/stream?callSid=${callSid}&phone=${encodeURIComponent(phone)}`;
 
   const twiml = `
 <Response>
@@ -85,7 +94,8 @@ app.post('/start-call', async (req, res) => {
   console.log('[Start-Call] Payload received:', req.body);
 
   const phone = sanitizePhone(req.body.phone);
-  const webhookUrl = `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
+  const webhookUrl =
+    `https://${PUBLIC_HOST}/twilio-voice-webhook?phone=${encodeURIComponent(phone)}`;
 
   try {
     const params = new URLSearchParams({
@@ -107,7 +117,7 @@ app.post('/start-call', async (req, res) => {
     );
 
     console.log('[Start-Call] Twilio call created:', result.data.sid);
-    res.json({ success: true });
+    res.json({ success: true, callSid: result.data.sid });
   } catch (err) {
     console.error('[Start-Call] ERROR:', err.response?.data || err.message);
     res.status(500).json({ error: 'Call failed' });
@@ -127,12 +137,13 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, ws => {
     ws.callSid = url.searchParams.get('callSid');
     ws.phone = url.searchParams.get('phone');
+    console.log('[WS Upgrade]', ws.callSid, ws.phone);
     wss.emit('connection', ws);
   });
 });
 
 /* ========================
-   GEMINI (HTTP — CORRECT)
+   GEMINI (HTTP)
 ======================== */
 async function callGemini(prompt) {
   console.log('[Gemini] Prompt:', prompt);
@@ -148,9 +159,7 @@ async function callGemini(prompt) {
     }
   );
 
-  const text = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  console.log('[Gemini] Response:', text);
-  return text;
+  return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
 /* ========================
@@ -173,7 +182,9 @@ async function tts(text) {
    WS CONNECTION
 ======================== */
 wss.on('connection', ws => {
-  console.log('[WS] Twilio MediaStream connected:', ws.callSid);
+  console.log('[WS] MediaStream connected:', ws.callSid);
+
+  let twilioReady = false;
 
   const dg = new WebSocket(
     'wss://api.deepgram.com/v1/listen?model=nova&language=en-US',
@@ -193,15 +204,25 @@ wss.on('connection', ws => {
     if (!reply) return;
 
     const audio = await tts(reply);
-    ws.send(JSON.stringify({
-      event: 'media',
-      media: { payload: audio }
-    }));
+
+    if (twilioReady) {
+      safeSend(ws, {
+        event: 'media',
+        media: { payload: audio }
+      });
+    }
   });
 
   ws.on('message', msg => {
     const data = JSON.parse(msg.toString());
-    if (data.event === 'media') {
+
+    if (data.event === 'start') {
+      console.log('[Twilio] Stream started');
+      twilioReady = true;
+      return;
+    }
+
+    if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
       dg.send(JSON.stringify({
         type: 'input_audio_buffer.append',
         audio: data.media.payload
@@ -211,7 +232,8 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     console.log('[WS] Closed:', ws.callSid);
-    dg.close();
+    if (dg.readyState === WebSocket.OPEN) dg.close();
+    delete callMap[ws.callSid];
   });
 });
 
