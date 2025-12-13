@@ -56,9 +56,7 @@ app.post('/twilio-voice-webhook', (req, res) => {
 
   res.type('text/xml').send(`
 <Response>
-  <Say voice="alice">
-    Hi, please hold while I connect you.
-  </Say>
+  <Say voice="alice">Hi, please hold while I connect you.</Say>
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
@@ -116,17 +114,21 @@ async function tts(text) {
 }
 
 /* ========================
-   AUDIO CONVERSION
+   AUDIO CONVERSION (CORRECT)
 ======================== */
 async function convertToMulaw(buffer) {
   return new Promise(resolve => {
     const ff = spawn('ffmpeg', [
+      '-f', 's16le',
+      '-ar', '22050',
+      '-ac', '1',
       '-i', 'pipe:0',
       '-f', 'mulaw',
       '-ar', '8000',
       '-ac', '1',
       'pipe:1'
     ]);
+
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
     ff.on('close', () => resolve(Buffer.concat(chunks)));
@@ -136,13 +138,20 @@ async function convertToMulaw(buffer) {
 }
 
 /* ========================
-   SEND AUDIO (FIXED)
+   SEND AUDIO (TWILIO-CORRECT)
 ======================== */
 async function sendAudio(ws, buffer) {
   if (!ws.streamSid) {
     console.error('🔥 Missing streamSid — cannot send audio');
     return;
   }
+
+  // 🔔 REQUIRED MARK EVENT (TWILIO SYNC)
+  ws.send(JSON.stringify({
+    event: 'mark',
+    streamSid: ws.streamSid,
+    mark: { name: 'ai-start' }
+  }));
 
   const audio = await convertToMulaw(buffer);
 
@@ -158,7 +167,8 @@ async function sendAudio(ws, buffer) {
       }
     }));
 
-    await new Promise(r => setTimeout(r, 20));
+    // 🕒 Slower pacing = audible audio
+    await new Promise(r => setTimeout(r, 25));
   }
 }
 
@@ -183,7 +193,7 @@ wss.on('connection', ws => {
 
     if (data.event === 'start') {
       ws.callSid = data.start.callSid;
-      ws.streamSid = data.start.streamSid; // 🔑 REQUIRED
+      ws.streamSid = data.start.streamSid;
 
       log('TWILIO', 'Stream started', ws.callSid, ws.streamSid);
 
