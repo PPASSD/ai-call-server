@@ -1,14 +1,10 @@
 require('dotenv').config();
 
 /* ========================
-   HARD FAIL DEBUGGING
+   GLOBAL DEBUG
 ======================== */
-process.on('uncaughtException', e => {
-  console.error('🔥 UNCAUGHT EXCEPTION', e);
-});
-process.on('unhandledRejection', e => {
-  console.error('🔥 UNHANDLED PROMISE', e);
-});
+process.on('uncaughtException', e => console.error('🔥 UNCAUGHT EXCEPTION', e));
+process.on('unhandledRejection', e => console.error('🔥 UNHANDLED PROMISE', e));
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -35,7 +31,7 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-console.log('🚀 BOOTING SERVER');
+console.log('🚀 SERVER BOOTING');
 console.log('🌐 PUBLIC_HOST:', PUBLIC_HOST);
 console.log('🤖 GEMINI_MODEL:', GEMINI_MODEL);
 
@@ -45,41 +41,32 @@ console.log('🤖 GEMINI_MODEL:', GEMINI_MODEL);
 const memory = {};
 
 /* ========================
-   EXPRESS
+   EXPRESS + PARSERS
 ======================== */
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 /* ========================
-   LOGGING HELPER
+   LOGGING
 ======================== */
-const log = (flag, ...args) => {
-  console.log(`[${flag}]`, ...args);
-};
+const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
 
 /* ========================
-   HEALTH CHECK (IMPORTANT)
+   HEALTH CHECK
 ======================== */
-app.get('/', (_, res) => {
-  res.send('✅ AI Call Server Alive');
-});
-
-app.get('/health', (_, res) => {
-  res.json({ ok: true, timestamp: Date.now() });
-});
+app.get('/', (_, res) => res.send('✅ AI Call Server Alive'));
+app.get('/health', (_, res) => res.json({ ok: true, timestamp: Date.now() }));
 
 /* ========================
-   TWILIO VOICE WEBHOOK
+   TWILIO WEBHOOK
 ======================== */
 app.post('/twilio-voice-webhook', (req, res) => {
   const callSid = req.body.CallSid;
   log('TWILIO', 'Incoming call', callSid);
 
   memory[callSid] = [];
-
   const wsUrl = `wss://${PUBLIC_HOST}/stream?callSid=${callSid}`;
 
-  // 🔥 CRITICAL: SAY SOMETHING IMMEDIATELY
   res.type('text/xml').send(`
 <Response>
   <Say voice="alice">
@@ -88,12 +75,17 @@ app.post('/twilio-voice-webhook', (req, res) => {
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
+  <!-- Keep call alive -->
+  <Pause length="600" />
 </Response>
 `);
 });
 
+// Optional GET to prevent browser "Cannot GET" noise
+app.get('/twilio-voice-webhook', (_, res) => res.send('Twilio webhook expects POST'));
+
 /* ========================
-   OPTIONAL OUTBOUND CALL
+   OUTBOUND CALL (OPTIONAL)
 ======================== */
 app.post('/start-call', async (req, res) => {
   log('TWILIO', 'Start call payload', req.body);
@@ -106,12 +98,7 @@ app.post('/start-call', async (req, res) => {
         From: TWILIO_NUMBER,
         Url: `https://${PUBLIC_HOST}/twilio-voice-webhook`
       }),
-      {
-        auth: {
-          username: TWILIO_ACCOUNT_SID,
-          password: TWILIO_AUTH_TOKEN
-        }
-      }
+      { auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN } }
     );
 
     log('TWILIO', 'Outbound call SID', result.data.sid);
@@ -147,14 +134,12 @@ server.on('upgrade', (req, socket, head) => {
 ======================== */
 async function callGemini(text) {
   log('GEMINI', 'Prompt:', text);
-
   try {
     const resp = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
       { contents: [{ role: 'user', parts: [{ text }] }] },
       { params: { key: GEMINI_API_KEY } }
     );
-
     const reply = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     log('GEMINI', 'Reply:', reply);
     return reply;
@@ -172,10 +157,7 @@ async function tts(text) {
   const r = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
     { text },
-    {
-      headers: { 'xi-api-key': ELEVENLABS_KEY },
-      responseType: 'arraybuffer'
-    }
+    { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
   );
   return Buffer.from(r.data);
 }
@@ -185,20 +167,10 @@ async function tts(text) {
 ======================== */
 function convert(buffer) {
   return new Promise(resolve => {
-    const ff = spawn('ffmpeg', [
-      '-i', 'pipe:0',
-      '-f', 'mulaw',
-      '-ar', '8000',
-      '-ac', '1',
-      'pipe:1'
-    ]);
-
+    const ff = spawn('ffmpeg', ['-i', 'pipe:0', '-f', 'mulaw', '-ar', '8000', '-ac', '1', 'pipe:1']);
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
-    ff.on('close', () =>
-      resolve(Buffer.concat(chunks).toString('base64'))
-    );
-
+    ff.on('close', () => resolve(Buffer.concat(chunks).toString('base64')));
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
@@ -219,6 +191,7 @@ wss.on('connection', ws => {
   dg.on('open', () => log('DEEPGRAM', 'Connected'));
   dg.on('error', e => console.error('🔥 DEEPGRAM ERROR', e));
 
+  // Keepalive to Deepgram
   const keepAlive = setInterval(() => {
     if (dg.readyState === WebSocket.OPEN) {
       dg.send(JSON.stringify({ type: 'KeepAlive' }));
@@ -232,22 +205,37 @@ wss.on('connection', ws => {
 
     log('DEEPGRAM', 'Transcript:', transcript);
 
-    const reply = await callGemini(transcript);
-    if (!reply) return;
+    // Non-blocking AI
+    (async () => {
+      const reply = await callGemini(transcript);
+      if (!reply) return;
 
-    const audio = await convert(await tts(reply));
-
-    ws.send(JSON.stringify({
-      event: 'media',
-      media: { payload: audio }
-    }));
-
-    log('AUDIO', 'Reply sent');
+      const audio = await convert(await tts(reply));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ event: 'media', media: { payload: audio } }));
+        log('AUDIO', 'Reply sent');
+      }
+    })();
   });
 
   ws.on('message', msg => {
     const data = JSON.parse(msg.toString());
     log('TWILIO', 'Event:', data.event);
+
+    if (data.event === 'start') {
+      log('TWILIO', 'Stream started', data.start.callSid);
+
+      // 🔥 IMMEDIATE GREETING
+      (async () => {
+        const greeting = 'Hi, this is the pool assistant. How can I help you today?';
+        const audio = await convert(await tts(greeting));
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ event: 'media', media: { payload: audio } }));
+          log('AUDIO', 'Initial greeting sent');
+        }
+      })();
+      return;
+    }
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
@@ -266,6 +254,4 @@ wss.on('connection', ws => {
 /* ========================
    START SERVER
 ======================== */
-server.listen(port, () => {
-  console.log(`✅ Server listening on port ${port}`);
-});
+server.listen(port, () => console.log(`✅ Server listening on port ${port}`));
