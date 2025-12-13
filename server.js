@@ -1,4 +1,15 @@
 require('dotenv').config();
+
+/* ========================
+   HARD DEBUGGING (GLOBAL)
+======================== */
+process.on('uncaughtException', e => {
+  console.error('🔥 UNCAUGHT EXCEPTION', e);
+});
+process.on('unhandledRejection', e => {
+  console.error('🔥 UNHANDLED PROMISE', e);
+});
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const http = require('http');
@@ -21,13 +32,7 @@ const {
   GEMINI_API_KEY,
   GEMINI_MODEL,
   ELEVENLABS_KEY,
-  ELEVENLABS_VOICE,
-  DEBUG_TWILIO,
-  DEBUG_WS,
-  DEBUG_DEEPGRAM,
-  DEBUG_GEMINI,
-  DEBUG_TTS,
-  DEBUG_AUDIO
+  ELEVENLABS_VOICE
 } = process.env;
 
 console.log('🚀 BOOT');
@@ -46,15 +51,13 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 /* ========================
-   UTILS
+   LOGGING
 ======================== */
 const log = (flag, ...args) => {
-  if (flag === 'ALL' || process.env[`DEBUG_${flag}`] === 'true') {
+  if (process.env[`DEBUG_${flag}`] === 'true') {
     console.log(`[${flag}]`, ...args);
   }
 };
-
-const silenceFrame = Buffer.alloc(8000, 0xff).toString('base64');
 
 /* ========================
    TWILIO WEBHOOK
@@ -77,7 +80,7 @@ app.post('/twilio-voice-webhook', (req, res) => {
 });
 
 /* ========================
-   START CALL
+   START CALL (OPTIONAL)
 ======================== */
 app.post('/start-call', async (req, res) => {
   log('TWILIO', 'Start call payload', req.body);
@@ -101,7 +104,7 @@ app.post('/start-call', async (req, res) => {
     log('TWILIO', 'Call created', result.data.sid);
     res.json({ ok: true });
   } catch (e) {
-    log('TWILIO', 'CALL FAILED', e.response?.data || e.message);
+    console.error('🔥 CALL FAILED', e.response?.data || e.message);
     res.status(500).send('fail');
   }
 });
@@ -126,7 +129,7 @@ server.on('upgrade', (req, socket, head) => {
 /* ========================
    GEMINI
 ======================== */
-async function callGemini(callSid, text) {
+async function callGemini(text) {
   log('GEMINI', 'Prompt:', text);
 
   try {
@@ -140,7 +143,7 @@ async function callGemini(callSid, text) {
     log('GEMINI', 'Reply:', reply);
     return reply;
   } catch (e) {
-    log('GEMINI', 'ERROR', e.response?.data || e.message);
+    console.error('🔥 GEMINI ERROR', e.response?.data || e.message);
     return null;
   }
 }
@@ -155,7 +158,6 @@ async function tts(text) {
     { text },
     { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
   );
-  log('TTS', 'Audio bytes', r.data.byteLength);
   return Buffer.from(r.data);
 }
 
@@ -185,21 +187,20 @@ wss.on('connection', ws => {
 
   let twilioReady = false;
 
-  // keep-alive
-  const keepAlive = setInterval(() => {
-    if (twilioReady) {
-      log('AUDIO', 'Sending silence keepalive');
-      ws.send(JSON.stringify({ event: 'media', media: { payload: silenceFrame } }));
-    }
-  }, 500);
-
-  // Deepgram
+  /* ---------- Deepgram ---------- */
   const dg = new WebSocket(
     'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
   dg.on('open', () => log('DEEPGRAM', 'Connected'));
+
+  const dgKeepAlive = setInterval(() => {
+    if (dg.readyState === WebSocket.OPEN) {
+      dg.send(JSON.stringify({ type: 'KeepAlive' }));
+      log('DEEPGRAM', 'KeepAlive');
+    }
+  }, 5000);
 
   dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
@@ -208,41 +209,60 @@ wss.on('connection', ws => {
 
     log('DEEPGRAM', 'Transcript:', transcript);
 
-    const reply = await callGemini(callSid, transcript);
+    const reply = await callGemini(transcript);
     if (!reply) return;
 
     const audio = await convert(await tts(reply));
 
-    log('AUDIO', 'Sending audio to Twilio');
-    ws.send(JSON.stringify({ event: 'media', media: { payload: audio } }));
+    ws.send(JSON.stringify({
+      event: 'media',
+      media: { payload: audio }
+    }));
+
+    log('AUDIO', 'AI reply sent');
   });
 
+  /* ---------- Twilio Stream ---------- */
   ws.on('message', msg => {
     const data = JSON.parse(msg.toString());
+    log('WS', 'RAW EVENT', data.event);
 
     if (data.event === 'start') {
       log('TWILIO', 'Stream started', data.start.callSid);
       twilioReady = true;
+
+      // 🔥 IMMEDIATE GREETING
+      (async () => {
+        try {
+          const greeting = 'Hi, this is the pool assistant. How can I help you today?';
+          const audio = await convert(await tts(greeting));
+
+          ws.send(JSON.stringify({
+            event: 'media',
+            media: { payload: audio }
+          }));
+
+          log('AUDIO', 'Initial greeting sent');
+        } catch (e) {
+          console.error('🔥 GREETING ERROR', e);
+        }
+      })();
+
       return;
     }
 
-    if (data.event === 'media') {
-      log('AUDIO', 'Received audio from Twilio');
+    if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
-    }
-
-    if (data.event === 'stop') {
-      log('TWILIO', 'Stream stopped by Twilio');
     }
   });
 
   ws.on('close', () => {
     log('WS', 'CLOSED', callSid);
-    clearInterval(keepAlive);
+    clearInterval(dgKeepAlive);
     dg.close();
   });
 
-  ws.on('error', e => log('WS', 'ERROR', e));
+  ws.on('error', e => console.error('🔥 WS ERROR', e));
 });
 
 /* ========================
