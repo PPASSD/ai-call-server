@@ -182,11 +182,31 @@ async function convertToBuffer(buffer) {
 }
 
 /* ========================
+   SEND AUDIO CHUNKS
+======================== */
+async function sendAudioChunks(ws, buffer) {
+  const audioBuffer = await convertToBuffer(buffer);
+  const CHUNK_SIZE = 320; // 20ms μ-law
+  for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+    const chunk = audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64');
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
+    }
+  }
+}
+
+/* ========================
    WS HANDLER (CHUNKED AUDIO STREAM)
 ======================== */
 wss.on('connection', ws => {
   const callSid = ws.callSid;
   log('WS', 'Connected', callSid);
+
+  if (!callSid) {
+    console.error('🔥 WS missing callSid');
+    ws.close();
+    return;
+  }
 
   // Deepgram setup
   const dg = new WebSocket(
@@ -201,7 +221,7 @@ wss.on('connection', ws => {
     if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: 'KeepAlive' }));
   }, 5000);
 
-  // Handle incoming Deepgram transcripts
+  // Handle Deepgram transcripts
   dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
     const transcript = data.channel?.alternatives?.[0]?.transcript;
@@ -209,24 +229,12 @@ wss.on('connection', ws => {
 
     log('DEEPGRAM', 'Transcript:', transcript);
 
-    // Non-blocking AI reply streaming
-    (async () => {
-      const reply = await callGemini(transcript);
-      if (!reply) return;
+    const reply = await callGemini(transcript);
+    if (!reply) return;
 
-      const ttsBuffer = await tts(reply);
-      const audioBuffer = await convertToBuffer(ttsBuffer);
-
-      const CHUNK_SIZE = 320; // 20ms μ-law chunks
-      for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
-        const chunk = audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64');
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
-        }
-        await new Promise(r => setTimeout(r, 20));
-      }
-      log('AUDIO', 'AI reply streamed in chunks');
-    })();
+    const ttsBuffer = await tts(reply);
+    await sendAudioChunks(ws, ttsBuffer);
+    log('AUDIO', 'AI reply sent');
   });
 
   ws.on('message', async msg => {
@@ -236,19 +244,9 @@ wss.on('connection', ws => {
     if (data.event === 'start') {
       log('TWILIO', 'Stream started', data.start.callSid);
 
-      // Immediate greeting
       const greetingBuffer = await tts('Hi, this is the pool assistant. How can I help you today?');
-      const audioBuffer = await convertToBuffer(greetingBuffer);
-
-      const CHUNK_SIZE = 320;
-      for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
-        const chunk = audioBuffer.slice(i, i + CHUNK_SIZE).toString('base64');
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ event: 'media', media: { payload: chunk } }));
-        }
-        await new Promise(r => setTimeout(r, 20));
-      }
-      log('AUDIO', 'Initial greeting streamed in chunks');
+      await sendAudioChunks(ws, greetingBuffer);
+      log('AUDIO', 'Initial greeting sent');
     }
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
