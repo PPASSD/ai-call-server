@@ -5,6 +5,8 @@ const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
 const { URLSearchParams } = require('url');
+const fs = require('fs');
+const { spawn } = require('child_process');
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -60,6 +62,31 @@ function safeSend(ws, payload) {
   } else {
     console.warn('[WS] Tried to send but socket not OPEN');
   }
+}
+
+// Convert ElevenLabs audio to μ-law 8kHz PCM for Twilio
+async function convertToTwilioFormat(buffer) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-i', 'pipe:0',
+      '-f', 'mulaw',
+      '-ar', '8000',
+      '-ac', '1',
+      'pipe:1'
+    ]);
+
+    const chunks = [];
+    ffmpeg.stdout.on('data', chunk => chunks.push(chunk));
+    ffmpeg.stderr.on('data', () => {}); // ignore logs
+
+    ffmpeg.on('close', () => {
+      const twilioAudio = Buffer.concat(chunks).toString('base64');
+      resolve(twilioAudio);
+    });
+
+    ffmpeg.stdin.write(buffer);
+    ffmpeg.stdin.end();
+  });
 }
 
 /* ========================
@@ -148,18 +175,23 @@ server.on('upgrade', (req, socket, head) => {
 async function callGemini(prompt) {
   console.log('[Gemini] Prompt:', prompt);
 
-  const resp = await axios.post(
-    `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
-    {
-      contents: [{ role: 'user', parts: [{ text: prompt }] }]
-    },
-    {
-      params: { key: GEMINI_API_KEY },
-      headers: { 'Content-Type': 'application/json' }
-    }
-  );
+  try {
+    const resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }]
+      },
+      {
+        params: { key: GEMINI_API_KEY },
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
 
-  return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  } catch (err) {
+    console.error('[Gemini] ERROR:', err.response?.data || err.message);
+    return '';
+  }
 }
 
 /* ========================
@@ -175,7 +207,7 @@ async function tts(text) {
       responseType: 'arraybuffer'
     }
   );
-  return Buffer.from(r.data).toString('base64');
+  return Buffer.from(r.data);
 }
 
 /* ========================
@@ -186,8 +218,11 @@ wss.on('connection', ws => {
 
   let twilioReady = false;
 
+  // -------------------
+  // Deepgram setup
+  // -------------------
   const dg = new WebSocket(
-    'wss://api.deepgram.com/v1/listen?model=nova&language=en-US',
+    'wss://api.deepgram.com/v1/listen?model=nova-2&language=en-US&encoding=mulaw&sample_rate=8000&channels=1',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
@@ -200,15 +235,26 @@ wss.on('connection', ws => {
     if (!transcript) return;
     console.log('[Deepgram] Transcript:', transcript);
 
+    // -------------------
+    // Gemini
+    // -------------------
     const reply = await callGemini(transcript);
     if (!reply) return;
+    console.log('[Gemini Reply]:', reply);
 
-    const audio = await tts(reply);
+    // -------------------
+    // ElevenLabs TTS
+    // -------------------
+    const elevenAudio = await tts(reply);
+    const twilioAudio = await convertToTwilioFormat(elevenAudio);
 
+    // -------------------
+    // Send back to Twilio
+    // -------------------
     if (twilioReady) {
       safeSend(ws, {
         event: 'media',
-        media: { payload: audio }
+        media: { payload: twilioAudio }
       });
     }
   });
@@ -223,10 +269,9 @@ wss.on('connection', ws => {
     }
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
-      dg.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: data.media.payload
-      }));
+      // send raw base64 audio to Deepgram
+      const audioBuffer = Buffer.from(data.media.payload, 'base64');
+      dg.send(audioBuffer);
     }
   });
 
