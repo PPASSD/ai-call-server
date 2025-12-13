@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 /* ========================
-   HARD DEBUGGING (GLOBAL)
+   HARD FAIL DEBUGGING
 ======================== */
 process.on('uncaughtException', e => {
   console.error('🔥 UNCAUGHT EXCEPTION', e);
@@ -35,9 +35,9 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-console.log('🚀 BOOT');
-console.log('Public Host:', PUBLIC_HOST);
-console.log('Gemini Model:', GEMINI_MODEL);
+console.log('🚀 BOOTING SERVER');
+console.log('🌐 PUBLIC_HOST:', PUBLIC_HOST);
+console.log('🤖 GEMINI_MODEL:', GEMINI_MODEL);
 
 /* ========================
    STATE
@@ -51,16 +51,25 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 /* ========================
-   LOGGING
+   LOGGING HELPER
 ======================== */
 const log = (flag, ...args) => {
-  if (process.env[`DEBUG_${flag}`] === 'true') {
-    console.log(`[${flag}]`, ...args);
-  }
+  console.log(`[${flag}]`, ...args);
 };
 
 /* ========================
-   TWILIO WEBHOOK
+   HEALTH CHECK (IMPORTANT)
+======================== */
+app.get('/', (_, res) => {
+  res.send('✅ AI Call Server Alive');
+});
+
+app.get('/health', (_, res) => {
+  res.json({ ok: true, timestamp: Date.now() });
+});
+
+/* ========================
+   TWILIO VOICE WEBHOOK
 ======================== */
 app.post('/twilio-voice-webhook', (req, res) => {
   const callSid = req.body.CallSid;
@@ -70,8 +79,12 @@ app.post('/twilio-voice-webhook', (req, res) => {
 
   const wsUrl = `wss://${PUBLIC_HOST}/stream?callSid=${callSid}`;
 
+  // 🔥 CRITICAL: SAY SOMETHING IMMEDIATELY
   res.type('text/xml').send(`
 <Response>
+  <Say voice="alice">
+    Hi, please hold while I connect you.
+  </Say>
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
@@ -80,7 +93,7 @@ app.post('/twilio-voice-webhook', (req, res) => {
 });
 
 /* ========================
-   START CALL (OPTIONAL)
+   OPTIONAL OUTBOUND CALL
 ======================== */
 app.post('/start-call', async (req, res) => {
   log('TWILIO', 'Start call payload', req.body);
@@ -101,7 +114,7 @@ app.post('/start-call', async (req, res) => {
       }
     );
 
-    log('TWILIO', 'Call created', result.data.sid);
+    log('TWILIO', 'Outbound call SID', result.data.sid);
     res.json({ ok: true });
   } catch (e) {
     console.error('🔥 CALL FAILED', e.response?.data || e.message);
@@ -117,7 +130,10 @@ const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `https://${req.headers.host}`);
-  if (url.pathname !== '/stream') return socket.destroy();
+  if (url.pathname !== '/stream') {
+    log('WS', 'Rejected upgrade', url.pathname);
+    return socket.destroy();
+  }
 
   wss.handleUpgrade(req, socket, head, ws => {
     ws.callSid = url.searchParams.get('callSid');
@@ -149,19 +165,25 @@ async function callGemini(text) {
 }
 
 /* ========================
-   ELEVENLABS
+   ELEVENLABS TTS
 ======================== */
 async function tts(text) {
-  log('TTS', 'Generating audio');
+  log('TTS', 'Generating speech');
   const r = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
     { text },
-    { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
+    {
+      headers: { 'xi-api-key': ELEVENLABS_KEY },
+      responseType: 'arraybuffer'
+    }
   );
   return Buffer.from(r.data);
 }
 
-async function convert(buffer) {
+/* ========================
+   AUDIO CONVERSION
+======================== */
+function convert(buffer) {
   return new Promise(resolve => {
     const ff = spawn('ffmpeg', [
       '-i', 'pipe:0',
@@ -170,9 +192,13 @@ async function convert(buffer) {
       '-ac', '1',
       'pipe:1'
     ]);
+
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
-    ff.on('close', () => resolve(Buffer.concat(chunks).toString('base64')));
+    ff.on('close', () =>
+      resolve(Buffer.concat(chunks).toString('base64'))
+    );
+
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
@@ -185,20 +211,17 @@ wss.on('connection', ws => {
   const callSid = ws.callSid;
   log('WS', 'Connected', callSid);
 
-  let twilioReady = false;
-
-  /* ---------- Deepgram ---------- */
   const dg = new WebSocket(
     'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
   dg.on('open', () => log('DEEPGRAM', 'Connected'));
+  dg.on('error', e => console.error('🔥 DEEPGRAM ERROR', e));
 
-  const dgKeepAlive = setInterval(() => {
+  const keepAlive = setInterval(() => {
     if (dg.readyState === WebSocket.OPEN) {
       dg.send(JSON.stringify({ type: 'KeepAlive' }));
-      log('DEEPGRAM', 'KeepAlive');
     }
   }, 5000);
 
@@ -219,37 +242,12 @@ wss.on('connection', ws => {
       media: { payload: audio }
     }));
 
-    log('AUDIO', 'AI reply sent');
+    log('AUDIO', 'Reply sent');
   });
 
-  /* ---------- Twilio Stream ---------- */
   ws.on('message', msg => {
     const data = JSON.parse(msg.toString());
-    log('WS', 'RAW EVENT', data.event);
-
-    if (data.event === 'start') {
-      log('TWILIO', 'Stream started', data.start.callSid);
-      twilioReady = true;
-
-      // 🔥 IMMEDIATE GREETING
-      (async () => {
-        try {
-          const greeting = 'Hi, this is the pool assistant. How can I help you today?';
-          const audio = await convert(await tts(greeting));
-
-          ws.send(JSON.stringify({
-            event: 'media',
-            media: { payload: audio }
-          }));
-
-          log('AUDIO', 'Initial greeting sent');
-        } catch (e) {
-          console.error('🔥 GREETING ERROR', e);
-        }
-      })();
-
-      return;
-    }
+    log('TWILIO', 'Event:', data.event);
 
     if (data.event === 'media' && dg.readyState === WebSocket.OPEN) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
@@ -257,8 +255,8 @@ wss.on('connection', ws => {
   });
 
   ws.on('close', () => {
-    log('WS', 'CLOSED', callSid);
-    clearInterval(dgKeepAlive);
+    log('WS', 'Closed', callSid);
+    clearInterval(keepAlive);
     dg.close();
   });
 
@@ -266,8 +264,8 @@ wss.on('connection', ws => {
 });
 
 /* ========================
-   START
+   START SERVER
 ======================== */
-server.listen(port, () =>
-  console.log(`✅ Server listening on ${port}`)
-);
+server.listen(port, () => {
+  console.log(`✅ Server listening on port ${port}`);
+});
