@@ -66,7 +66,6 @@ app.post("/twilio-voice-webhook", (req, res) => {
   `);
 });
 
-
 /* ========================
    SERVER + WS
 ======================== */
@@ -114,11 +113,11 @@ async function tts(text) {
 }
 
 /* ========================
-   AUDIO CONVERSION
+   AUDIO CONVERSION (Linux FFmpeg)
 ======================== */
 function convertToMulaw(buffer) {
   return new Promise((resolve, reject) => {
-    const ff = spawn("C:\\ffmpeg\\bin\\ffmpeg.exe", [
+    const ff = spawn("ffmpeg", [
       "-hide_banner",
       "-loglevel", "error",
       "-i", "pipe:0",
@@ -151,7 +150,7 @@ async function sendAudio(ws, mp3Buffer) {
 
   log("AUDIO", "Mulaw buffer length:", mulaw.length);
 
-  // 🔑 PRIME WITH SILENCE (15 frames)
+  // Prime with silence (15 frames)
   const silence = Buffer.alloc(FRAME, 0xff);
   for (let i = 0; i < 15; i++) {
     ws.send(JSON.stringify({
@@ -162,12 +161,11 @@ async function sendAudio(ws, mp3Buffer) {
     await sleep(25);
   }
 
-  // 🔊 SEND REAL AUDIO
+  // Send real audio
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
 
     let chunk = mulaw.slice(i, i + FRAME);
-    // pad last frame if smaller than FRAME
     if (chunk.length < FRAME) {
       const pad = Buffer.alloc(FRAME - chunk.length, 0xff);
       chunk = Buffer.concat([chunk, pad]);
@@ -208,7 +206,6 @@ wss.on("connection", ws => {
       ws.streamSid = data.start.streamSid;
       log("TWILIO", "Stream started", ws.streamSid);
 
-      // 🔊 Send a welcome greeting via ElevenLabs
       aiSpeaking = true;
       const greetingBuffer = await tts("Hello! Yes, I'm here and ready to chat. How can I help you today?");
       await sendAudio(ws, greetingBuffer);
@@ -243,7 +240,6 @@ wss.on("connection", ws => {
     dg.close();
   });
 });
-
 
 /* ========================
    START SERVER
