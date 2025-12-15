@@ -31,6 +31,7 @@ const {
 console.log('🚀 SERVER BOOTING');
 console.log('🌐 PUBLIC_HOST:', PUBLIC_HOST);
 console.log('🤖 GEMINI_MODEL:', GEMINI_MODEL);
+console.log('🔊 ELEVENLABS_VOICE:', ELEVENLABS_VOICE);
 
 /* ========================
    EXPRESS
@@ -56,7 +57,9 @@ app.post('/twilio-voice-webhook', (req, res) => {
 
   res.type('text/xml').send(`
 <Response>
-  <Say voice="alice">Hi, please hold while I connect you.</Say>
+  <Say voice="alice">
+    Hi, please hold while I connect you.
+  </Say>
   <Start>
     <Stream url="${wsUrl}" />
   </Start>
@@ -64,10 +67,6 @@ app.post('/twilio-voice-webhook', (req, res) => {
 </Response>
 `);
 });
-
-app.get('/twilio-voice-webhook', (_, res) =>
-  res.send('Twilio webhook expects POST')
-);
 
 /* ========================
    SERVER + WS
@@ -79,7 +78,7 @@ server.on('upgrade', (req, socket, head) => {
   if (!req.url.startsWith('/stream')) return socket.destroy();
 
   wss.handleUpgrade(req, socket, head, ws => {
-    log('WS', 'Upgrade OK (waiting for start event)');
+    log('WS', 'Upgrade OK (waiting for start)');
     wss.emit('connection', ws);
   });
 });
@@ -94,7 +93,7 @@ async function callGemini(text) {
       { contents: [{ role: 'user', parts: [{ text }] }] },
       { params: { key: GEMINI_API_KEY } }
     );
-    return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
   } catch (e) {
     console.error('🔥 GEMINI ERROR', e.response?.data || e.message);
     return null;
@@ -102,26 +101,49 @@ async function callGemini(text) {
 }
 
 /* ========================
-   ELEVENLABS TTS
+   ELEVENLABS TTS (FIXED)
 ======================== */
 async function tts(text) {
-  const r = await axios.post(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
-    { text },
-    { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
-  );
-  return Buffer.from(r.data);
+  console.log('🔊 [11LABS] Sending text:', text);
+
+  try {
+    const r = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
+      {
+        text,
+        model_id: 'eleven_monolingual_v1'
+      },
+      {
+        headers: {
+          'xi-api-key': ELEVENLABS_KEY,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'arraybuffer',
+        timeout: 15000
+      }
+    );
+
+    const buffer = Buffer.from(r.data);
+    console.log('🔊 [11LABS] Audio bytes:', buffer.length);
+
+    if (buffer.length < 1000) return null;
+    return buffer;
+  } catch (err) {
+    console.error(
+      '🔥 [11LABS ERROR]',
+      err.response?.status,
+      err.response?.data?.toString() || err.message
+    );
+    return null;
+  }
 }
 
 /* ========================
-   AUDIO CONVERSION (CORRECT)
+   AUDIO CONVERSION
 ======================== */
-async function convertToMulaw(buffer) {
+function convertToMulaw(buffer) {
   return new Promise(resolve => {
     const ff = spawn('ffmpeg', [
-      '-f', 's16le',
-      '-ar', '22050',
-      '-ac', '1',
       '-i', 'pipe:0',
       '-f', 'mulaw',
       '-ar', '8000',
@@ -132,26 +154,17 @@ async function convertToMulaw(buffer) {
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
     ff.on('close', () => resolve(Buffer.concat(chunks)));
+
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
 }
 
 /* ========================
-   SEND AUDIO (TWILIO-CORRECT)
+   SEND AUDIO (TWILIO SAFE)
 ======================== */
 async function sendAudio(ws, buffer) {
-  if (!ws.streamSid) {
-    console.error('🔥 Missing streamSid — cannot send audio');
-    return;
-  }
-
-  // 🔔 REQUIRED MARK EVENT (TWILIO SYNC)
-  ws.send(JSON.stringify({
-    event: 'mark',
-    streamSid: ws.streamSid,
-    mark: { name: 'ai-start' }
-  }));
+  if (!ws.streamSid || !buffer) return;
 
   const audio = await convertToMulaw(buffer);
 
@@ -167,13 +180,12 @@ async function sendAudio(ws, buffer) {
       }
     }));
 
-    // 🕒 Slower pacing = audible audio
-    await new Promise(r => setTimeout(r, 25));
+    await new Promise(r => setTimeout(r, 20));
   }
 }
 
 /* ========================
-   WS HANDLER
+   WS HANDLER (FINAL)
 ======================== */
 wss.on('connection', ws => {
   log('WS', 'Connected');
@@ -198,18 +210,12 @@ wss.on('connection', ws => {
       log('TWILIO', 'Stream started', ws.callSid, ws.streamSid);
 
       aiSpeaking = true;
-      const greeting = await tts(
-        'Hi, this is the pool assistant. How can I help you today?'
-      );
-      await sendAudio(ws, greeting);
+      const greeting = await tts('Hi, this is the pool assistant. How can I help you today?');
+      if (greeting) await sendAudio(ws, greeting);
       aiSpeaking = false;
     }
 
-    if (
-      data.event === 'media' &&
-      dg.readyState === WebSocket.OPEN &&
-      !aiSpeaking
-    ) {
+    if (data.event === 'media' && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
       dg.send(Buffer.from(data.media.payload, 'base64'));
     }
   });
@@ -222,7 +228,7 @@ wss.on('connection', ws => {
     if (!transcript || transcript.length < 3) return;
 
     const now = Date.now();
-    if (aiSpeaking || now - lastTranscriptAt < 800) return;
+    if (aiSpeaking || now - lastTranscriptAt < 900) return;
     lastTranscriptAt = now;
 
     log('DEEPGRAM', 'FINAL:', transcript);
@@ -238,7 +244,7 @@ wss.on('connection', ws => {
     log('GEMINI', reply);
 
     const audio = await tts(reply);
-    await sendAudio(ws, audio);
+    if (audio) await sendAudio(ws, audio);
 
     aiSpeaking = false;
   });
