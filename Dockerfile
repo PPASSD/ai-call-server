@@ -1,22 +1,31 @@
+# ========================
+# Dockerfile for AI Call Server
+# ========================
+
 # Use official Node.js LTS image
 FROM node:20-slim
-
-# Install FFmpeg
-RUN apt-get update && apt-get install -y ffmpeg
 
 # Set working directory
 WORKDIR /usr/src/app
 
-# Copy package files and install dependencies
+# Install system dependencies (FFmpeg for audio processing)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy package files first for caching npm install
 COPY package*.json ./
+
+# Install production dependencies
 RUN npm install --production
 
-# Copy the rest of your app
+# Copy the rest of the application
 COPY . .
 
-# Expose port (Render will use $PORT environment variable)
+# Expose port (Render will set $PORT automatically)
 ENV PORT 10000
 EXPOSE $PORT
 
-# Start the app
+# Start the Node.js server
 CMD ["node", "server.js"]
