@@ -1,11 +1,4 @@
 require("dotenv").config();
-
-/* ========================
-   GLOBAL DEBUG
-======================== */
-process.on("uncaughtException", e => console.error("🔥 UNCAUGHT EXCEPTION", e));
-process.on("unhandledRejection", e => console.error("🔥 UNHANDLED PROMISE", e));
-
 const express = require("express");
 const bodyParser = require("body-parser");
 const http = require("http");
@@ -16,9 +9,6 @@ const axios = require("axios");
 const app = express();
 const port = process.env.PORT || 10000;
 
-/* ========================
-   ENV VARIABLES
-======================== */
 const {
   PUBLIC_HOST,
   DG_API_KEY,
@@ -28,49 +18,31 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-console.log("🚀 SERVER BOOTING");
-console.log("🌐 PUBLIC_HOST:", PUBLIC_HOST);
-console.log("🤖 GEMINI_MODEL:", GEMINI_MODEL);
-console.log("🔊 ELEVENLABS_VOICE:", ELEVENLABS_VOICE);
+const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
 
-/* ========================
-   EXPRESS SETUP
-======================== */
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
-
-/* ========================
-   HEALTH CHECK
-======================== */
+// Health check
 app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* ========================
-   TWILIO VOICE WEBHOOK
-======================== */
+// Twilio Webhook
 app.post("/twilio-voice-webhook", (req, res) => {
-  log("TWILIO", "Incoming call", req.body.CallSid);
+  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  const wsUrl = `${PUBLIC_HOST}/stream`; // full HTTPS URL
+  log("TWILIO", "Incoming call", req.body.CallSid);
 
   res.type("text/xml").send(`
 <Response>
-  <Say voice="alice">
-    Hi, please hold while I connect you.
-  </Say>
   <Start>
-    <Stream url="${wsUrl}" track="both"/>
+    <Stream url="${wsUrl}" track="outbound"/>
   </Start>
-  <Pause length="600"/>
 </Response>
   `);
 });
 
-/* ========================
-   SERVER + WEBSOCKET
-======================== */
+// HTTP + WebSocket server
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -82,14 +54,10 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-/* ========================
-   HELPERS
-======================== */
+// Helpers
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* ========================
-   GEMINI API
-======================== */
+// Gemini AI
 async function callGemini(text) {
   try {
     log("GEMINI", "Prompt:", text);
@@ -105,9 +73,7 @@ async function callGemini(text) {
   }
 }
 
-/* ========================
-   ELEVENLABS TTS
-======================== */
+// ElevenLabs TTS
 async function tts(text) {
   try {
     log("ELEVENLABS", "TTS:", text);
@@ -123,14 +89,11 @@ async function tts(text) {
   }
 }
 
-/* ========================
-   AUDIO CONVERSION
-======================== */
+// Convert audio to 8kHz mulaw PCM
 function convertToMulaw(buffer) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
-      "-hide_banner",
-      "-loglevel", "error",
+      "-hide_banner", "-loglevel", "error",
       "-i", "pipe:0",
       "-ac", "1",
       "-ar", "8000",
@@ -150,24 +113,20 @@ function convertToMulaw(buffer) {
   });
 }
 
-/* ========================
-   SEND AUDIO TO TWILIO
-======================== */
+// Send audio frames to Twilio
 async function sendAudio(ws, buffer) {
   if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) return;
 
   const mulaw = await convertToMulaw(buffer);
-  const FRAME = 320; // 20ms @ 8kHz
-  log("AUDIO", "Mulaw buffer length:", mulaw.length);
+  const FRAME = 160; // 20ms @ 8kHz
 
-  // Prime stream with silence (50 frames)
+  // Prime with 10 frames of silence
   const silence = Buffer.alloc(FRAME, 0xff);
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 10; i++) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(25);
   }
 
-  // Send audio in frames
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
@@ -176,15 +135,12 @@ async function sendAudio(ws, buffer) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
     await sleep(25);
   }
-  log("AUDIO", "Total audio frames sent");
+  log("AUDIO", "Total audio frames sent:", mulaw.length);
 }
 
-/* ========================
-   WEBSOCKET HANDLER
-======================== */
+// WebSocket handling
 wss.on("connection", ws => {
   log("WS", "Connected");
-
   let aiSpeaking = false;
 
   const dg = new WebSocket(
@@ -201,14 +157,14 @@ wss.on("connection", ws => {
       ws.streamSid = data.start.streamSid;
       log("TWILIO", "Stream started", ws.streamSid);
 
-      // Send initial greeting
+      // Send welcome message
       aiSpeaking = true;
       const greetingBuffer = await tts("Hello! Yes, I'm here and ready to chat. How can I help you today?");
       if (greetingBuffer) await sendAudio(ws, greetingBuffer);
       aiSpeaking = false;
     }
 
-    if (data.event === "media" && dg.readyState === WebSocket.OPEN && !aiSpeaking) {
+    if (data.event === "media" && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
       dg.send(Buffer.from(data.media.payload, "base64"));
     }
   });
@@ -237,7 +193,5 @@ wss.on("connection", ws => {
   });
 });
 
-/* ========================
-   START SERVER
-======================== */
+// Start server
 server.listen(port, () => console.log(`✅ Server listening on ${port}`));
