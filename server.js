@@ -5,6 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const { spawn } = require("child_process");
 const axios = require("axios");
+const twilioClient = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -16,10 +17,11 @@ const {
   GEMINI_MODEL,
   ELEVENLABS_KEY,
   ELEVENLABS_VOICE,
-  DEFAULT_PHONE
+  DEFAULT_PHONE,
+  TWILIO_NUMBER
 } = process.env;
 
-// Simple logger with optional debug flag
+// Simple logger
 const DEBUG = true;
 const log = (flag, ...args) => {
   if (DEBUG) console.log(`[${flag}]`, ...args);
@@ -34,26 +36,50 @@ app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ============================
+   GO HIGH LEVEL WEBHOOK
+   Receives JSON, triggers Twilio call
+============================ */
+app.post("/go-highlevel-webhook", async (req, res) => {
+  const phone = req.body.contact?.phone;
+  if (!phone) {
+    log("GHL", "No phone provided in webhook payload");
+    return res.status(400).send("No phone provided");
+  }
+
+  log("GHL", "Webhook received for", phone);
+
+  try {
+    const call = await twilioClient.calls.create({
+      to: phone,
+      from: TWILIO_NUMBER || DEFAULT_PHONE,
+      url: `https://${PUBLIC_HOST}/twilio-voice-webhook` // AI stream attaches here
+    });
+
+    log("TWILIO", "Call initiated", call.sid);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("🔥 TWILIO CALL ERROR", err);
+    res.status(500).send(err.message);
+  }
+});
+
+/* ============================
    TWILIO VOICE WEBHOOK
-   Optimized for GoHighLevel
+   Handles AI streaming when call is answered
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
   const callSid = req.body.CallSid || "UNKNOWN";
-  const phone = req.body.contact?.phone || DEFAULT_PHONE;
-
-  log("TWILIO", "Incoming call from GoHighLevel", callSid, "Dialing:", phone);
+  log("TWILIO", "Incoming call answered", callSid);
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  // TwiML: Dial the contact's phone, attach AI stream after connection
+  // TwiML: attach AI stream to the call
   res.type("text/xml").send(`
 <Response>
-  <Dial action="/twilio-dial-complete" callerId="${DEFAULT_PHONE}">
-    <Number>${phone}</Number>
-  </Dial>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
+  <Pause length="30"/>
 </Response>
   `);
 });
@@ -141,13 +167,11 @@ async function sendAudio(ws, buffer) {
   const FRAME = 160; // 20ms @ 8kHz
   const silence = Buffer.alloc(FRAME, 0xff);
 
-  // Prime with 5 frames silence
   for (let i = 0; i < 5; i++) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(20);
   }
 
-  // Send actual audio frames
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
