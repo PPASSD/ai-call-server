@@ -27,16 +27,16 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Twilio Webhook
+// Twilio Webhook: <Start> uses track="both" so AI audio can be sent
 app.post("/twilio-voice-webhook", (req, res) => {
-  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
-
   log("TWILIO", "Incoming call", req.body.CallSid);
+
+  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
   res.type("text/xml").send(`
 <Response>
   <Start>
-    <Stream url="${wsUrl}" track="outbound"/>
+    <Stream url="${wsUrl}" track="both"/>
   </Start>
 </Response>
   `);
@@ -54,7 +54,7 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-// Helpers
+// Helper
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Gemini AI
@@ -115,7 +115,10 @@ function convertToMulaw(buffer) {
 
 // Send audio frames to Twilio
 async function sendAudio(ws, buffer) {
-  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) return;
+  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
+    log("AUDIO", "Skipped: ws not ready or no buffer");
+    return;
+  }
 
   const mulaw = await convertToMulaw(buffer);
   const FRAME = 160; // 20ms @ 8kHz
@@ -131,11 +134,11 @@ async function sendAudio(ws, buffer) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
     if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
-
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
     await sleep(25);
   }
-  log("AUDIO", "Total audio frames sent:", mulaw.length);
+
+  log("AUDIO", "Sent audio frames:", mulaw.length);
 }
 
 // WebSocket handling
@@ -152,10 +155,16 @@ wss.on("connection", ws => {
 
   ws.on("message", async msg => {
     const data = JSON.parse(msg.toString());
+    console.log("WS MESSAGE RECEIVED:", data); // DEBUG
 
     if (data.event === "start") {
-      ws.streamSid = data.start.streamSid;
+      ws.streamSid = data.start?.streamSid;
       log("TWILIO", "Stream started", ws.streamSid);
+
+      if (!ws.streamSid) {
+        console.error("❌ No streamSid received!");
+        return;
+      }
 
       // Send welcome message
       aiSpeaking = true;
