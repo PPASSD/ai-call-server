@@ -5,10 +5,14 @@ const http = require("http");
 const WebSocket = require("ws");
 const { spawn } = require("child_process");
 const axios = require("axios");
-const twilioClient = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const twilioClient = require("twilio")(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const mime = require("mime"); // added to set proper Content-Type for static files
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -33,8 +37,13 @@ const log = (flag, ...args) => {
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Serve static files (for silence.mp3)
-app.use(express.static(path.join(__dirname, "public")));
+// Serve static files (for silence.mp3) with correct Content-Type
+app.use("/public", express.static(path.join(__dirname, "public"), {
+  setHeaders: (res, filePath) => {
+    const type = mime.getType(filePath);
+    if (type) res.setHeader("Content-Type", type);
+  }
+}));
 
 app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
@@ -62,12 +71,13 @@ app.post("/twilio-voice-webhook", async (req, res) => {
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
+  // Return TwiML with proper Content-Type
   res.type("text/xml").send(`
 <Response>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Pause length="3600"/>
+  <Play>https://${PUBLIC_HOST}/public/silence.mp3</Play>
 </Response>
   `);
 });
@@ -75,12 +85,13 @@ app.post("/twilio-voice-webhook", async (req, res) => {
 app.post("/twilio-call-handler", (req, res) => {
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
+  // Return TwiML with proper Content-Type
   res.type("text/xml").send(`
 <Response>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Pause length="3600"/>
+  <Play>https://${PUBLIC_HOST}/public/silence.mp3</Play>
 </Response>
   `);
 });
