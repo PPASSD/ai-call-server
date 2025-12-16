@@ -5,98 +5,49 @@ const http = require("http");
 const WebSocket = require("ws");
 const { spawn } = require("child_process");
 const axios = require("axios");
-const twilioClient = require("twilio")(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const mime = require("mime"); // added to set proper Content-Type for static files
 
 const app = express();
 const port = process.env.PORT || 10000;
 
-let {
+const {
   PUBLIC_HOST,
   DG_API_KEY,
   GEMINI_API_KEY,
   GEMINI_MODEL,
   ELEVENLABS_KEY,
-  ELEVENLABS_VOICE,
-  TWILIO_NUMBER
+  ELEVENLABS_VOICE
 } = process.env;
 
-// Normalize PUBLIC_HOST to avoid double https://
-PUBLIC_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "");
-
-// Simple logger
+// Simple logger with optional debug flag
 const DEBUG = true;
 const log = (flag, ...args) => {
   if (DEBUG) console.log(`[${flag}]`, ...args);
 };
 
-// Body parser
+// Body parsing
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Serve static files (for silence.mp3) with correct Content-Type
-app.use("/public", express.static(path.join(__dirname, "public"), {
-  setHeaders: (res, filePath) => {
-    const type = mime.getType(filePath);
-    if (type) res.setHeader("Content-Type", type);
-  }
-}));
-
+// Health check
 app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ============================
-   TWILIO WEBHOOKS
+   TWILIO VOICE WEBHOOK
 ============================ */
-app.post("/twilio-voice-webhook", async (req, res) => {
-  const contact = req.body.contact;
+app.post("/twilio-voice-webhook", (req, res) => {
+  const callSid = req.body.CallSid || "UNKNOWN";
+  log("TWILIO", "Incoming call", callSid);
 
-  if (contact && contact.phone) {
-    try {
-      const call = await twilioClient.calls.create({
-        to: contact.phone,
-        from: TWILIO_NUMBER,
-        url: `https://${PUBLIC_HOST}/twilio-call-handler` // safe now
-      });
-      log("TWILIO", "Outbound call initiated", call.sid);
-      return res.status(200).send({ success: true, callSid: call.sid });
-    } catch (err) {
-      console.error("🔥 TWILIO CALL ERROR", err.message);
-      return res.status(500).send({ error: err.message });
-    }
-  }
+  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  const wsUrl = `wss://${PUBLIC_HOST}/stream`;
-  const silenceUrl = `https://${PUBLIC_HOST}/public/silence.mp3`;
-
-  // Return TwiML with proper Content-Type
+  // TwiML: start stream (both directions) + long pause to keep call alive
   res.type("text/xml").send(`
 <Response>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Play>${silenceUrl}</Play>
-</Response>
-  `);
-});
-
-app.post("/twilio-call-handler", (req, res) => {
-  const wsUrl = `wss://${PUBLIC_HOST}/stream`;
-  const silenceUrl = `https://${PUBLIC_HOST}/public/silence.mp3`;
-
-  // Return TwiML with proper Content-Type
-  res.type("text/xml").send(`
-<Response>
-  <Start>
-    <Stream url="${wsUrl}" track="both"/>
-  </Start>
-  <Play>${silenceUrl}</Play>
+  <Pause length="3600"/>
 </Response>
   `);
 });
@@ -108,17 +59,39 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url.startsWith("/stream")) return socket.destroy();
+  if (!req.url.startsWith("/stream")) {
+    log("WS", "Rejected upgrade request:", req.url);
+    return socket.destroy();
+  }
   wss.handleUpgrade(req, socket, head, ws => {
     log("WS", "Upgrade OK - new client connected");
     wss.emit("connection", ws);
   });
 });
 
+// Helpers
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   AUDIO CONVERSION
+   ELEVENLABS TTS
+============================ */
+async function tts(text) {
+  try {
+    log("ELEVENLABS", "TTS text:", text);
+    const r = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
+      { text, model_id: "eleven_monolingual_v1" },
+      { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
+    );
+    return Buffer.from(r.data);
+  } catch (err) {
+    console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
+    return null;
+  }
+}
+
+/* ============================
+   CONVERT AUDIO TO MULAW
 ============================ */
 function convertToMulaw(buffer) {
   return new Promise((resolve, reject) => {
@@ -131,73 +104,43 @@ function convertToMulaw(buffer) {
       "-f", "mulaw",
       "pipe:1"
     ]);
+
     const chunks = [];
     ff.stdout.on("data", d => chunks.push(d));
     ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
-    ff.on("close", () => resolve(Buffer.concat(chunks)));
     ff.on("error", reject);
+    ff.on("close", () => resolve(Buffer.concat(chunks)));
+
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
 }
 
 /* ============================
-   ELEVENLABS TTS
-============================ */
-async function tts(text) {
-  try {
-    log("ELEVENLABS", "TTS text:", text);
-
-    const r = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
-      { text, model_id: "eleven_monolingual_v1" },
-      { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
-    );
-
-    const tmp = path.join(os.tmpdir(), `tts-${Date.now()}.wav`);
-    fs.writeFileSync(tmp, Buffer.from(r.data));
-    const buffer = fs.readFileSync(tmp);
-    fs.unlinkSync(tmp);
-    return buffer;
-  } catch (err) {
-    console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
-    return null;
-  }
-}
-
-/* ============================
-   SEND AUDIO
+   SEND AUDIO TO TWILIO
 ============================ */
 async function sendAudio(ws, buffer) {
-  if (!ws.readyForAudio || ws.readyState !== WebSocket.OPEN || !buffer) {
+  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
     log("AUDIO", "Skipped: ws not ready or buffer missing");
     return;
   }
 
   const mulaw = await convertToMulaw(buffer);
-  const FRAME = 160;
+  const FRAME = 160; // 20ms @ 8kHz
   const silence = Buffer.alloc(FRAME, 0xff);
 
-  // Prime with silence
+  // Prime with 5 frames silence
   for (let i = 0; i < 5; i++) {
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid: ws.streamSid,
-      media: { payload: silence.toString("base64"), track: "outbound" }
-    }));
+    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(20);
   }
 
-  // Send actual frames
+  // Send actual audio frames
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
-    if (chunk.length < FRAME) chunk = Buffer.concat([chunk, silence.slice(0, FRAME - chunk.length)]);
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid: ws.streamSid,
-      media: { payload: chunk.toString("base64"), track: "outbound" }
-    }));
+    if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
+    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
     await sleep(20);
   }
 
@@ -225,11 +168,11 @@ async function callGemini(text) {
 }
 
 /* ============================
-   WS HANDLER
+   WEBSOCKET HANDLER
 ============================ */
 wss.on("connection", ws => {
   log("WS", "Client connected");
-  ws.readyForAudio = false;
+  let aiSpeaking = false;
 
   const dg = new WebSocket(
     "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true",
@@ -243,29 +186,17 @@ wss.on("connection", ws => {
   ws.on("message", async msg => {
     try {
       const data = JSON.parse(msg.toString());
-
       if (data.event === "start") {
-        ws.streamSid = data.start.streamSid;
+        ws.streamSid = data.start?.streamSid;
         log("TWILIO", "Stream started", ws.streamSid);
 
-        // Prime with silence immediately
-        const silence = Buffer.alloc(160, 0xff);
-        for (let i = 0; i < 10; i++) {
-          ws.send(JSON.stringify({
-            event: "media",
-            streamSid: ws.streamSid,
-            media: { payload: silence.toString("base64"), track: "outbound" }
-          }));
-        }
-
-        // Allow Twilio to receive audio
-        setTimeout(() => {
-          ws.readyForAudio = true;
-          log("AUDIO", "Twilio ready for outbound audio");
-        }, 500);
+        aiSpeaking = true;
+        const greeting = await tts("Hello! I am ready to chat.");
+        if (greeting) await sendAudio(ws, greeting);
+        aiSpeaking = false;
       }
 
-      if (data.event === "media" && dg.readyState === WebSocket.OPEN) {
+      if (data.event === "media" && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
         dg.send(Buffer.from(data.media.payload, "base64"));
       }
     } catch (err) {
@@ -281,11 +212,13 @@ wss.on("connection", ws => {
       if (!transcript) return;
       log("DEEPGRAM", "FINAL transcript:", transcript);
 
+      aiSpeaking = true;
       const reply = await callGemini(transcript);
-      if (!reply) return;
-
-      const audio = await tts(reply);
-      if (audio) await sendAudio(ws, audio);
+      if (reply) {
+        const replyBuffer = await tts(reply);
+        if (replyBuffer) await sendAudio(ws, replyBuffer);
+      }
+      aiSpeaking = false;
     } catch (err) {
       console.error("🔥 DEEPGRAM MESSAGE ERROR", err);
     }
