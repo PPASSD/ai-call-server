@@ -1,17 +1,20 @@
-require("dotenv").config();
+Working Code from 12-15-25 – Just no voice on phone
+
+
+require('dotenv').config();
 
 /* ========================
    GLOBAL DEBUG
 ======================== */
-process.on("uncaughtException", e => console.error("🔥 UNCAUGHT EXCEPTION", e));
-process.on("unhandledRejection", e => console.error("🔥 UNHANDLED PROMISE", e));
+process.on('uncaughtException', e => console.error('🔥 UNCAUGHT EXCEPTION', e));
+process.on('unhandledRejection', e => console.error('🔥 UNHANDLED PROMISE', e));
 
-const express = require("express");
-const bodyParser = require("body-parser");
-const http = require("http");
-const WebSocket = require("ws");
-const { spawn } = require("child_process");
-const axios = require("axios");
+const express = require('express');
+const bodyParser = require('body-parser');
+const http = require('http');
+const WebSocket = require('ws');
+const axios = require('axios');
+const { spawn } = require('child_process');
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -28,10 +31,9 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-console.log("🚀 SERVER BOOTING");
-console.log("🌐 PUBLIC_HOST:", PUBLIC_HOST);
-console.log("🤖 GEMINI_MODEL:", GEMINI_MODEL);
-console.log("🔊 ELEVENLABS_VOICE:", ELEVENLABS_VOICE);
+console.log('🚀 SERVER BOOTING');
+console.log('🌐 PUBLIC_HOST:', PUBLIC_HOST);
+console.log('🤖 GEMINI_MODEL:', GEMINI_MODEL);
 
 /* ========================
    EXPRESS
@@ -44,27 +46,33 @@ const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
 /* ========================
    HEALTH
 ======================== */
-app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get('/', (_, res) => res.send('✅ AI Call Server Alive'));
+app.get('/health', (_, res) => res.json({ ok: true }));
 
 /* ========================
-   TWILIO WEBHOOK
+   TWILIO VOICE WEBHOOK
 ======================== */
-app.post("/twilio-voice-webhook", (req, res) => {
-  log("TWILIO", "Incoming call", req.body.CallSid);
+app.post('/twilio-voice-webhook', (req, res) => {
+  log('TWILIO', 'Incoming call', req.body.CallSid);
 
-  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
+  const wsUrl = `wss://${PUBLIC_HOST}/stream`;
 
-  // Return TwiML that answers the call first, then starts the stream
-  res.type("text/xml").send(`
+  res.type('text/xml').send(`
 <Response>
-  <Answer/>
+  <Say voice="alice">
+    Hi, please hold while I connect you.
+  </Say>
   <Start>
-    <Stream url="${wsUrl}" track="both" />
+    <Stream url="${wsUrl}" />
   </Start>
+  <Pause length="600" />
 </Response>
-  `);
+`);
 });
+
+app.get('/twilio-voice-webhook', (_, res) =>
+  res.send('Twilio webhook expects POST')
+);
 
 /* ========================
    SERVER + WS
@@ -72,178 +80,171 @@ app.post("/twilio-voice-webhook", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-server.on("upgrade", (req, socket, head) => {
-  if (!req.url.startsWith("/stream")) return socket.destroy();
+server.on('upgrade', (req, socket, head) => {
+  if (!req.url.startsWith('/stream')) return socket.destroy();
 
   wss.handleUpgrade(req, socket, head, ws => {
-    log("WS", "Upgrade OK");
-    wss.emit("connection", ws);
+    log('WS', 'Upgrade OK (waiting for start event)');
+    wss.emit('connection', ws);
   });
 });
-
-/* ========================
-   HELPERS
-======================== */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ========================
    GEMINI
 ======================== */
 async function callGemini(text) {
-  log("GEMINI", "Prompt:", text);
-  const r = await axios.post(
-    `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
-    { contents: [{ role: "user", parts: [{ text }] }] },
-    { params: { key: GEMINI_API_KEY } }
-  );
-  return r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  try {
+    const resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
+      { contents: [{ role: 'user', parts: [{ text }] }] },
+      { params: { key: GEMINI_API_KEY } }
+    );
+    return resp.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  } catch (e) {
+    console.error('🔥 GEMINI ERROR', e.response?.data || e.message);
+    return null;
+  }
 }
 
 /* ========================
-   ELEVENLABS
+   ELEVENLABS TTS
 ======================== */
 async function tts(text) {
-  log("ELEVENLABS", "TTS:", text);
   const r = await axios.post(
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
     { text },
-    { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
+    { headers: { 'xi-api-key': ELEVENLABS_KEY }, responseType: 'arraybuffer' }
   );
   return Buffer.from(r.data);
 }
 
 /* ========================
-   AUDIO CONVERSION (Linux FFmpeg)
+   AUDIO CONVERSION
 ======================== */
-function convertToMulaw(buffer) {
-  return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-hide_banner",
-      "-loglevel", "error",
-      "-i", "pipe:0",
-      "-ac", "1",
-      "-ar", "8000",
-      "-acodec", "pcm_mulaw",
-      "-f", "mulaw",
-      "pipe:1"
+async function convertToMulaw(buffer) {
+  return new Promise(resolve => {
+    const ff = spawn('ffmpeg', [
+      '-i', 'pipe:0',
+      '-f', 'mulaw',
+      '-ar', '8000',
+      '-ac', '1',
+      'pipe:1'
     ]);
-
     const chunks = [];
-    ff.stdout.on("data", d => chunks.push(d));
-    ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
-    ff.on("error", reject);
-    ff.on("close", () => resolve(Buffer.concat(chunks)));
-
+    ff.stdout.on('data', d => chunks.push(d));
+    ff.on('close', () => resolve(Buffer.concat(chunks)));
     ff.stdin.write(buffer);
     ff.stdin.end();
   });
 }
 
 /* ========================
-   SEND AUDIO
+   SEND AUDIO (FIXED)
 ======================== */
-async function sendAudio(ws, mp3Buffer) {
-  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN) return;
-
-  const mulaw = await convertToMulaw(mp3Buffer);
-  const FRAME = 160; // 20ms @ 8kHz
-
-  log("AUDIO", "Mulaw buffer length:", mulaw.length);
-
-  // Prime with silence (15 frames)
-  const silence = Buffer.alloc(FRAME, 0xff);
-  for (let i = 0; i < 15; i++) {
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid: ws.streamSid,
-      media: { payload: silence.toString("base64"), track: "outbound" }
-    }));
-    await sleep(25);
+async function sendAudio(ws, buffer) {
+  if (!ws.streamSid) {
+    console.error('🔥 Missing streamSid — cannot send audio');
+    return;
   }
 
-  // Send real audio
-  for (let i = 0; i < mulaw.length; i += FRAME) {
-    if (ws.readyState !== WebSocket.OPEN) break;
+  const audio = await convertToMulaw(buffer);
 
-    let chunk = mulaw.slice(i, i + FRAME);
-    if (chunk.length < FRAME) {
-      const pad = Buffer.alloc(FRAME - chunk.length, 0xff);
-      chunk = Buffer.concat([chunk, pad]);
-    }
+  for (let i = 0; i < audio.length; i += 320) {
+    if (ws.readyState !== WebSocket.OPEN) return;
 
     ws.send(JSON.stringify({
-      event: "media",
+      event: 'media',
       streamSid: ws.streamSid,
-      media: { payload: chunk.toString("base64"), track: "outbound" }
+      media: {
+        payload: audio.slice(i, i + 320).toString('base64'),
+        track: 'outbound'
+      }
     }));
 
-    log("WS AUDIO FRAME", `Sent frame ${Math.floor(i / FRAME) + 1}, size: ${chunk.length}`);
-    await sleep(25);
+    await new Promise(r => setTimeout(r, 20));
   }
-
-  log("AUDIO", "Total audio bytes sent:", mulaw.length);
 }
 
 /* ========================
    WS HANDLER
 ======================== */
-wss.on("connection", ws => {
-  log("WS", "Connected");
+wss.on('connection', ws => {
+  log('WS', 'Connected');
 
   let aiSpeaking = false;
+  let lastTranscriptAt = 0;
 
   const dg = new WebSocket(
-    "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true",
+    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true',
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
-  dg.on("open", () => log("DEEPGRAM", "Connected"));
+  dg.on('open', () => log('DEEPGRAM', 'Connected'));
 
-  ws.on("message", async msg => {
+  ws.on('message', async msg => {
     const data = JSON.parse(msg.toString());
 
-    if (data.event === "start") {
-      ws.streamSid = data.start.streamSid;
-      log("TWILIO", "Stream started", ws.streamSid);
+    if (data.event === 'start') {
+      ws.callSid = data.start.callSid;
+      ws.streamSid = data.start.streamSid; // 🔑 REQUIRED
+
+      log('TWILIO', 'Stream started', ws.callSid, ws.streamSid);
 
       aiSpeaking = true;
-      const greetingBuffer = await tts("Hello! Yes, I'm here and ready to chat. How can I help you today?");
-      await sendAudio(ws, greetingBuffer);
+      const greeting = await tts(
+        'Hi, this is the pool assistant. How can I help you today?'
+      );
+      await sendAudio(ws, greeting);
       aiSpeaking = false;
     }
 
-    if (data.event === "media" && dg.readyState === WebSocket.OPEN && !aiSpeaking) {
-      dg.send(Buffer.from(data.media.payload, "base64"));
+    if (
+      data.event === 'media' &&
+      dg.readyState === WebSocket.OPEN &&
+      !aiSpeaking
+    ) {
+      dg.send(Buffer.from(data.media.payload, 'base64'));
     }
   });
 
-  dg.on("message", async msg => {
+  dg.on('message', async msg => {
     const data = JSON.parse(msg.toString());
     if (!data.is_final) return;
 
     const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!transcript) return;
+    if (!transcript || transcript.length < 3) return;
 
-    log("DEEPGRAM", "FINAL:", transcript);
+    const now = Date.now();
+    if (aiSpeaking || now - lastTranscriptAt < 800) return;
+    lastTranscriptAt = now;
+
+    log('DEEPGRAM', 'FINAL:', transcript);
 
     aiSpeaking = true;
+
     const reply = await callGemini(transcript);
-    if (reply) {
-      const replyBuffer = await tts(reply);
-      await sendAudio(ws, replyBuffer);
+    if (!reply) {
+      aiSpeaking = false;
+      return;
     }
+
+    log('GEMINI', reply);
+
+    const audio = await tts(reply);
+    await sendAudio(ws, audio);
+
     aiSpeaking = false;
   });
 
-  ws.on("close", () => {
-    log("WS", "Closed");
+  ws.on('close', () => {
+    log('WS', 'Closed', ws.callSid);
     dg.close();
   });
 });
 
 /* ========================
-   START SERVER
+   START
 ======================== */
-server.listen(port, () => {
-  console.log(`✅ Server listening on ${port}`);
-});
+server.listen(port, () =>
+  console.log(`✅ Server listening on ${port}`)
+);
