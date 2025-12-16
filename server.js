@@ -101,7 +101,7 @@ async function callGemini(text) {
 }
 
 /* ========================
-   ELEVENLABS TTS (FIXED)
+   ELEVENLABS TTS
 ======================== */
 async function tts(text) {
   console.log('🔊 [11LABS] Sending text:', text);
@@ -139,11 +139,13 @@ async function tts(text) {
 }
 
 /* ========================
-   AUDIO CONVERSION
+   AUDIO CONVERSION (FFMPEG)
 ======================== */
-function convertToMulaw(buffer) {
-  return new Promise(resolve => {
+async function convertToMulaw(buffer) {
+  return new Promise((resolve, reject) => {
     const ff = spawn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
       '-i', 'pipe:0',
       '-f', 'mulaw',
       '-ar', '8000',
@@ -153,7 +155,14 @@ function convertToMulaw(buffer) {
 
     const chunks = [];
     ff.stdout.on('data', d => chunks.push(d));
-    ff.on('close', () => resolve(Buffer.concat(chunks)));
+    ff.stderr.on('data', d => console.error('🔥 FFMPEG ERROR:', d.toString()));
+
+    ff.on('close', code => {
+      if (code !== 0) return reject(new Error(`FFmpeg exited with code ${code}`));
+      const result = Buffer.concat(chunks);
+      console.log('🔊 Converted audio length:', result.length);
+      resolve(result);
+    });
 
     ff.stdin.write(buffer);
     ff.stdin.end();
@@ -161,31 +170,36 @@ function convertToMulaw(buffer) {
 }
 
 /* ========================
-   SEND AUDIO (TWILIO SAFE)
+   SEND AUDIO TO TWILIO
 ======================== */
 async function sendAudio(ws, buffer) {
   if (!ws.streamSid || !buffer) return;
 
-  const audio = await convertToMulaw(buffer);
+  try {
+    const audio = await convertToMulaw(buffer);
+    if (!audio || audio.length === 0) return console.warn('⚠️ No audio to send');
 
-  for (let i = 0; i < audio.length; i += 320) {
-    if (ws.readyState !== WebSocket.OPEN) return;
+    for (let i = 0; i < audio.length; i += 320) {
+      if (ws.readyState !== WebSocket.OPEN) return;
 
-    ws.send(JSON.stringify({
-      event: 'media',
-      streamSid: ws.streamSid,
-      media: {
-        payload: audio.slice(i, i + 320).toString('base64'),
-        track: 'outbound'
-      }
-    }));
+      ws.send(JSON.stringify({
+        event: 'media',
+        streamSid: ws.streamSid,
+        media: {
+          payload: audio.slice(i, i + 320).toString('base64'),
+          track: 'outbound'
+        }
+      }));
 
-    await new Promise(r => setTimeout(r, 20));
+      await new Promise(r => setTimeout(r, 20));
+    }
+  } catch (e) {
+    console.error('🔥 sendAudio error', e);
   }
 }
 
 /* ========================
-   WS HANDLER (FINAL)
+   WS HANDLER
 ======================== */
 wss.on('connection', ws => {
   log('WS', 'Connected');
@@ -194,7 +208,7 @@ wss.on('connection', ws => {
   let lastTranscriptAt = 0;
 
   const dg = new WebSocket(
-    'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true',
+    `wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&endpointing=true`,
     { headers: { Authorization: `Token ${DG_API_KEY}` } }
   );
 
@@ -256,8 +270,6 @@ wss.on('connection', ws => {
 });
 
 /* ========================
-   START
+   START SERVER
 ======================== */
-server.listen(port, () =>
-  console.log(`✅ Server listening on ${port}`)
-);
+server.listen(port, () => console.log(`✅ Server listening on ${port}`));
