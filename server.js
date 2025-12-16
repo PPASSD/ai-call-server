@@ -43,7 +43,7 @@ app.post("/twilio-voice-webhook", (req, res) => {
   <Start>
     <Stream url="wss://ai-call-server-zqvh.onrender.com/stream" track="both"/>
   </Start>
-  <Say>Connecting your AI call now.</Say>
+  <Play>https://ai-call-server-zqvh.onrender.com/silence.mp3</Play>
 </Response>
   `);
 });
