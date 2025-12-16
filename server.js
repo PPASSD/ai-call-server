@@ -109,17 +109,32 @@ server.on("upgrade", (req, socket, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   ELEVENLABS TTS
+   ELEVENLABS TTS (Updated for proper Twilio streaming)
 ============================ */
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
 async function tts(text) {
   try {
     log("ELEVENLABS", "TTS text:", text);
+
+    // Request streaming TTS from Eleven Labs
     const r = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
       { text, model_id: "eleven_monolingual_v1" },
       { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
     );
-    return Buffer.from(r.data);
+
+    // Save temporary WAV file (ensures ffmpeg interprets format correctly)
+    const tmpFile = path.join(os.tmpdir(), `tts-${Date.now()}.wav`);
+    fs.writeFileSync(tmpFile, Buffer.from(r.data));
+
+    // Read the WAV file back into a buffer for ffmpeg
+    const buffer = fs.readFileSync(tmpFile);
+    fs.unlinkSync(tmpFile); // clean up
+
+    return buffer;
   } catch (err) {
     console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
     return null;
@@ -127,33 +142,7 @@ async function tts(text) {
 }
 
 /* ============================
-   CONVERT AUDIO TO MULAW
-============================ */
-function convertToMulaw(buffer) {
-  return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-ac", "1",
-      "-ar", "8000",
-      "-acodec", "pcm_mulaw",
-      "-f", "mulaw",
-      "pipe:1"
-    ]);
-
-    const chunks = [];
-    ff.stdout.on("data", d => chunks.push(d));
-    ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
-    ff.on("error", reject);
-    ff.on("close", () => resolve(Buffer.concat(chunks)));
-
-    ff.stdin.write(buffer);
-    ff.stdin.end();
-  });
-}
-
-/* ============================
-   SEND AUDIO TO TWILIO
+   SEND AUDIO TO TWILIO (Updated)
 ============================ */
 async function sendAudio(ws, buffer) {
   if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
@@ -161,11 +150,12 @@ async function sendAudio(ws, buffer) {
     return;
   }
 
+  // Convert to μ-law 8kHz mono for Twilio
   const mulaw = await convertToMulaw(buffer);
   const FRAME = 160; // 20ms @ 8kHz
   const silence = Buffer.alloc(FRAME, 0xff);
 
-  // Prime with 5 frames silence
+  // Prime with 5 frames silence to avoid Twilio cutting off start
   for (let i = 0; i < 5; i++) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(20);
@@ -182,6 +172,7 @@ async function sendAudio(ws, buffer) {
 
   log("AUDIO", `Sent ${Math.ceil(mulaw.length / FRAME)} frames`);
 }
+
 
 /* ============================
    GEMINI AI
