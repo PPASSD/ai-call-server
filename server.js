@@ -18,12 +18,10 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-// GLOBAL DEBUG
-const DEBUG_VERBOSE = true; // set to false to reduce repeated logs
+// Logging helper
 const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
-process.on("uncaughtException", e => console.error("🔥 UNCAUGHT EXCEPTION", e));
-process.on("unhandledRejection", e => console.error("🔥 UNHANDLED PROMISE", e));
 
+// Body parsing
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -35,20 +33,19 @@ app.get("/health", (_, res) => res.json({ ok: true }));
    TWILIO VOICE WEBHOOK
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
-  log("TWILIO", "Incoming call", req.body.CallSid, "From:", req.body.From);
+  log("TWILIO", "Incoming call", req.body.CallSid);
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
+  // TwiML response: start media stream, track both directions
   res.type("text/xml").send(`
 <Response>
   <Start>
-    <Stream url="wss://ai-call-server-zqvh.onrender.com/stream" track="both"/>
+    <Stream url="${wsUrl}" track="both"/>
   </Start>
 </Response>
-
   `);
 });
-
 
 /* ============================
    SERVER + WEBSOCKET
@@ -57,38 +54,15 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url.startsWith("/stream")) {
-    log("WS", "Upgrade request rejected:", req.url);
-    return socket.destroy();
-  }
+  if (!req.url.startsWith("/stream")) return socket.destroy();
   wss.handleUpgrade(req, socket, head, ws => {
     log("WS", "Upgrade OK - new client connected");
     wss.emit("connection", ws);
   });
 });
 
-// Helper
+// Helpers
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-/* ============================
-   GEMINI AI
-============================ */
-async function callGemini(text) {
-  try {
-    log("GEMINI", "Prompt:", text);
-    const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
-      { contents: [{ role: "user", parts: [{ text }] }] },
-      { params: { key: GEMINI_API_KEY } }
-    );
-    const reply = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
-    log("GEMINI", "Reply:", reply);
-    return reply;
-  } catch (err) {
-    console.error("🔥 GEMINI ERROR", err.response?.data || err.message);
-    return null;
-  }
-}
 
 /* ============================
    ELEVENLABS TTS
@@ -101,7 +75,6 @@ async function tts(text) {
       { text, model_id: "eleven_monolingual_v1" },
       { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
     );
-    log("ELEVENLABS", "TTS buffer received:", r.data.byteLength, "bytes");
     return Buffer.from(r.data);
   } catch (err) {
     console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
@@ -126,15 +99,9 @@ function convertToMulaw(buffer) {
 
     const chunks = [];
     ff.stdout.on("data", d => chunks.push(d));
-    ff.stderr.on("data", e => DEBUG_VERBOSE && console.error("[FFMPEG]", e.toString()));
-    ff.on("error", err => {
-      console.error("🔥 FFMPEG ERROR", err);
-      reject(err);
-    });
-    ff.on("close", () => {
-      DEBUG_VERBOSE && log("FFMPEG", "Conversion complete. Total bytes:", Buffer.concat(chunks).length);
-      resolve(Buffer.concat(chunks));
-    });
+    ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
+    ff.on("error", reject);
+    ff.on("close", () => resolve(Buffer.concat(chunks)));
 
     ff.stdin.write(buffer);
     ff.stdin.end();
@@ -145,30 +112,45 @@ function convertToMulaw(buffer) {
    SEND AUDIO TO TWILIO
 ============================ */
 async function sendAudio(ws, buffer) {
-  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
-    log("AUDIO", "Skipped: ws not ready or no buffer");
-    return;
-  }
+  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) return;
 
   const mulaw = await convertToMulaw(buffer);
-  const FRAME = 160; // 20ms
+  const FRAME = 160; // 20ms @ 8kHz
 
-  // Prime with silence
+  // Prime with a few silent frames
   const silence = Buffer.alloc(FRAME, 0xff);
-  for (let i = 0; i < 5; i++) ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
+  for (let i = 0; i < 5; i++) {
+    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
+    await sleep(25);
+  }
 
-  // Send actual audio with throttled logging
-  const totalFrames = Math.ceil(mulaw.length / FRAME);
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
     if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
-
-    if (i % (FRAME * 10) === 0) log("AUDIO", `Sent frame ${i / FRAME + 1}/${totalFrames}`); // throttle log every 10 frames
     await sleep(25);
   }
-  log("AUDIO", "Completed sending audio. Total frames:", totalFrames);
+
+  log("AUDIO", "Completed sending audio. Frames:", Math.ceil(mulaw.length / FRAME));
+}
+
+/* ============================
+   GEMINI AI
+============================ */
+async function callGemini(text) {
+  try {
+    log("GEMINI", "Prompt:", text);
+    const r = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
+      { contents: [{ role: "user", parts: [{ text }] }] },
+      { params: { key: GEMINI_API_KEY } }
+    );
+    return r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  } catch (err) {
+    console.error("🔥 GEMINI ERROR", err.response?.data || err.message);
+    return null;
+  }
 }
 
 /* ============================
@@ -190,21 +172,18 @@ wss.on("connection", ws => {
   ws.on("message", async msg => {
     try {
       const data = JSON.parse(msg.toString());
-      DEBUG_VERBOSE && log("WS MSG", data);
 
       if (data.event === "start") {
         ws.streamSid = data.start?.streamSid;
         log("TWILIO", "Stream started", ws.streamSid);
-        if (!ws.streamSid) return console.error("❌ Missing streamSid!");
 
         aiSpeaking = true;
-        const greetingBuffer = await tts("Hello! I'm ready to chat with you.");
-        if (greetingBuffer) await sendAudio(ws, greetingBuffer);
+        const greeting = await tts("Hello! I'm ready to chat with you.");
+        if (greeting) await sendAudio(ws, greeting);
         aiSpeaking = false;
       }
 
       if (data.event === "media" && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
-        DEBUG_VERBOSE && log("WS MEDIA", "Sending audio to DeepGram:", data.media?.payload?.length || 0, "bytes");
         dg.send(Buffer.from(data.media.payload, "base64"));
       }
     } catch (err) {
@@ -216,7 +195,6 @@ wss.on("connection", ws => {
     try {
       const data = JSON.parse(msg.toString());
       if (!data.is_final) return;
-
       const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
       if (!transcript) return;
       log("DEEPGRAM", "FINAL transcript:", transcript);
@@ -233,11 +211,15 @@ wss.on("connection", ws => {
     }
   });
 
-  ws.on("close", () => log("WS", "Client disconnected"));
+  ws.on("close", () => {
+    log("WS", "Client disconnected");
+    dg.close();
+  });
+
   ws.on("error", err => console.error("🔥 WS ERROR", err));
 });
 
 /* ============================
    START SERVER
 ============================ */
-server.listen(port, () => console.log(`✅ Server listening on ${port}`));
+server.listen(port, () => log("SERVER", `Listening on ${port}`));
