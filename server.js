@@ -5,6 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const { spawn } = require("child_process");
 const axios = require("axios");
+const twilioClient = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -15,7 +16,8 @@ const {
   GEMINI_API_KEY,
   GEMINI_MODEL,
   ELEVENLABS_KEY,
-  ELEVENLABS_VOICE
+  ELEVENLABS_VOICE,
+  TWILIO_NUMBER
 } = process.env;
 
 // Simple logger with optional debug flag
@@ -33,15 +35,49 @@ app.get("/", (_, res) => res.send("✅ AI Call Server Alive"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ============================
-   TWILIO VOICE WEBHOOK
+   TWILIO VOICE WEBHOOK (Inbound & Outbound)
 ============================ */
-app.post("/twilio-voice-webhook", (req, res) => {
+app.post("/twilio-voice-webhook", async (req, res) => {
+  const contact = req.body.contact;
+
+  // If contact exists, this is a GHL-initiated outbound call
+  if (contact && contact.phone) {
+    try {
+      const call = await twilioClient.calls.create({
+        to: contact.phone,
+        from: TWILIO_NUMBER,
+        url: `https://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/twilio-call-handler`
+      });
+      log("TWILIO", "Outbound call initiated", call.sid);
+      return res.status(200).send({ success: true, callSid: call.sid });
+    } catch (err) {
+      console.error("🔥 TWILIO CALL ERROR", err.message);
+      return res.status(500).send({ error: err.message });
+    }
+  }
+
+  // Otherwise, this is an inbound call from Twilio
   const callSid = req.body.CallSid || "UNKNOWN";
   log("TWILIO", "Incoming call", callSid);
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  // TwiML: start stream (both directions) + long pause to keep call alive
+  res.type("text/xml").send(`
+<Response>
+  <Start>
+    <Stream url="${wsUrl}" track="both"/>
+  </Start>
+  <Pause length="3600"/>
+</Response>
+  `);
+});
+
+/* ============================
+   TWILIO CALL HANDLER (TwiML for outbound)
+============================ */
+app.post("/twilio-call-handler", (req, res) => {
+  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
+
   res.type("text/xml").send(`
 <Response>
   <Start>
@@ -191,8 +227,7 @@ wss.on("connection", ws => {
         log("TWILIO", "Stream started", ws.streamSid);
 
         aiSpeaking = true;
-        const greeting = await tts("Hello! I am ready to chat.");
-        if (greeting) await sendAudio(ws, greeting);
+        // Removed default greeting; AI will respond only when caller speaks
         aiSpeaking = false;
       }
 
