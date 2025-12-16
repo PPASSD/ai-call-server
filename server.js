@@ -19,6 +19,7 @@ const {
 } = process.env;
 
 // GLOBAL DEBUG
+const DEBUG_VERBOSE = true; // set to false to reduce repeated logs
 const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
 process.on("uncaughtException", e => console.error("🔥 UNCAUGHT EXCEPTION", e));
 process.on("unhandledRejection", e => console.error("🔥 UNHANDLED PROMISE", e));
@@ -35,19 +36,17 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
-
   log("TWILIO", "Incoming call", req.body.CallSid);
 
+  // Simplified TwiML: no long pauses, media starts immediately
   res.type("text/xml").send(`
 <Response>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Pause length="60"/>
 </Response>
   `);
 });
-
 
 /* ============================
    SERVER + WEBSOCKET
@@ -125,13 +124,13 @@ function convertToMulaw(buffer) {
 
     const chunks = [];
     ff.stdout.on("data", d => chunks.push(d));
-    ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
+    ff.stderr.on("data", e => DEBUG_VERBOSE && console.error("[FFMPEG]", e.toString()));
     ff.on("error", err => {
       console.error("🔥 FFMPEG ERROR", err);
       reject(err);
     });
     ff.on("close", () => {
-      log("FFMPEG", "Conversion complete. Total bytes:", Buffer.concat(chunks).length);
+      DEBUG_VERBOSE && log("FFMPEG", "Conversion complete. Total bytes:", Buffer.concat(chunks).length);
       resolve(Buffer.concat(chunks));
     });
 
@@ -149,27 +148,25 @@ async function sendAudio(ws, buffer) {
     return;
   }
 
-  log("AUDIO", "Sending audio...");
   const mulaw = await convertToMulaw(buffer);
   const FRAME = 160; // 20ms
 
   // Prime with silence
   const silence = Buffer.alloc(FRAME, 0xff);
-  for (let i = 0; i < 10; i++) {
-    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
-    await sleep(25);
-  }
+  for (let i = 0; i < 5; i++) ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
 
-  // Send actual audio
+  // Send actual audio with throttled logging
+  const totalFrames = Math.ceil(mulaw.length / FRAME);
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
     if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
-    log("AUDIO", "Sent frame", i / FRAME + 1, "/", Math.ceil(mulaw.length / FRAME));
+
+    if (i % (FRAME * 10) === 0) log("AUDIO", `Sent frame ${i / FRAME + 1}/${totalFrames}`); // throttle log every 10 frames
     await sleep(25);
   }
-  log("AUDIO", "Completed sending audio. Total bytes:", mulaw.length);
+  log("AUDIO", "Completed sending audio. Total frames:", totalFrames);
 }
 
 /* ============================
@@ -185,21 +182,19 @@ wss.on("connection", ws => {
   );
 
   dg.on("open", () => log("DEEPGRAM", "Connected"));
-
   dg.on("close", () => log("DEEPGRAM", "Connection closed"));
   dg.on("error", err => console.error("🔥 DEEPGRAM ERROR", err));
 
   ws.on("message", async msg => {
     try {
       const data = JSON.parse(msg.toString());
-      log("WS MSG", data);
+      DEBUG_VERBOSE && log("WS MSG", data);
 
       if (data.event === "start") {
         ws.streamSid = data.start?.streamSid;
         log("TWILIO", "Stream started", ws.streamSid);
         if (!ws.streamSid) return console.error("❌ Missing streamSid!");
 
-        // Send initial greeting
         aiSpeaking = true;
         const greetingBuffer = await tts("Hello! I'm ready to chat with you.");
         if (greetingBuffer) await sendAudio(ws, greetingBuffer);
@@ -207,7 +202,7 @@ wss.on("connection", ws => {
       }
 
       if (data.event === "media" && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
-        log("WS MEDIA", "Sending audio to DeepGram:", data.media?.payload?.length || 0, "bytes");
+        DEBUG_VERBOSE && log("WS MEDIA", "Sending audio to DeepGram:", data.media?.payload?.length || 0, "bytes");
         dg.send(Buffer.from(data.media.payload, "base64"));
       }
     } catch (err) {
@@ -219,6 +214,7 @@ wss.on("connection", ws => {
     try {
       const data = JSON.parse(msg.toString());
       if (!data.is_final) return;
+
       const transcript = data.channel?.alternatives?.[0]?.transcript?.trim();
       if (!transcript) return;
       log("DEEPGRAM", "FINAL transcript:", transcript);
@@ -235,11 +231,7 @@ wss.on("connection", ws => {
     }
   });
 
-  ws.on("close", () => {
-    log("WS", "Client disconnected");
-    dg.close();
-  });
-
+  ws.on("close", () => log("WS", "Client disconnected"));
   ws.on("error", err => console.error("🔥 WS ERROR", err));
 });
 
