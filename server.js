@@ -17,7 +17,7 @@ const mime = require("mime"); // added to set proper Content-Type for static fil
 const app = express();
 const port = process.env.PORT || 10000;
 
-const {
+let {
   PUBLIC_HOST,
   DG_API_KEY,
   GEMINI_API_KEY,
@@ -26,6 +26,9 @@ const {
   ELEVENLABS_VOICE,
   TWILIO_NUMBER
 } = process.env;
+
+// Normalize PUBLIC_HOST to avoid double https://
+PUBLIC_HOST = (PUBLIC_HOST || "").replace(/^https?:\/\//, "");
 
 // Simple logger
 const DEBUG = true;
@@ -59,7 +62,7 @@ app.post("/twilio-voice-webhook", async (req, res) => {
       const call = await twilioClient.calls.create({
         to: contact.phone,
         from: TWILIO_NUMBER,
-        url: `https://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/twilio-call-handler`
+        url: `https://${PUBLIC_HOST}/twilio-call-handler` // safe now
       });
       log("TWILIO", "Outbound call initiated", call.sid);
       return res.status(200).send({ success: true, callSid: call.sid });
@@ -69,7 +72,8 @@ app.post("/twilio-voice-webhook", async (req, res) => {
     }
   }
 
-  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
+  const wsUrl = `wss://${PUBLIC_HOST}/stream`;
+  const silenceUrl = `https://${PUBLIC_HOST}/public/silence.mp3`;
 
   // Return TwiML with proper Content-Type
   res.type("text/xml").send(`
@@ -77,13 +81,14 @@ app.post("/twilio-voice-webhook", async (req, res) => {
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Play>https://${PUBLIC_HOST}/public/silence.mp3</Play>
+  <Play>${silenceUrl}</Play>
 </Response>
   `);
 });
 
 app.post("/twilio-call-handler", (req, res) => {
-  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
+  const wsUrl = `wss://${PUBLIC_HOST}/stream`;
+  const silenceUrl = `https://${PUBLIC_HOST}/public/silence.mp3`;
 
   // Return TwiML with proper Content-Type
   res.type("text/xml").send(`
@@ -91,7 +96,7 @@ app.post("/twilio-call-handler", (req, res) => {
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Play>https://${PUBLIC_HOST}/public/silence.mp3</Play>
+  <Play>${silenceUrl}</Play>
 </Response>
   `);
 });
