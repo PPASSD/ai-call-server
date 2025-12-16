@@ -6,6 +6,9 @@ const WebSocket = require("ws");
 const { spawn } = require("child_process");
 const axios = require("axios");
 const twilioClient = require("twilio")(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -109,30 +112,49 @@ server.on("upgrade", (req, socket, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   ELEVENLABS TTS (Updated for proper Twilio streaming)
+   CONVERT AUDIO TO MULAW
 ============================ */
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+function convertToMulaw(buffer) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-hide_banner", "-loglevel", "error",
+      "-i", "pipe:0",
+      "-ac", "1",
+      "-ar", "8000",
+      "-acodec", "pcm_mulaw",
+      "-f", "mulaw",
+      "pipe:1"
+    ]);
 
+    const chunks = [];
+    ff.stdout.on("data", d => chunks.push(d));
+    ff.stderr.on("data", e => console.error("[FFMPEG]", e.toString()));
+    ff.on("error", reject);
+    ff.on("close", () => resolve(Buffer.concat(chunks)));
+
+    ff.stdin.write(buffer);
+    ff.stdin.end();
+  });
+}
+
+/* ============================
+   ELEVENLABS TTS (Updated for Twilio)
+============================ */
 async function tts(text) {
   try {
     log("ELEVENLABS", "TTS text:", text);
 
-    // Request streaming TTS from Eleven Labs
     const r = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
       { text, model_id: "eleven_monolingual_v1" },
       { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
     );
 
-    // Save temporary WAV file (ensures ffmpeg interprets format correctly)
+    // Save temporary WAV file to ensure correct format
     const tmpFile = path.join(os.tmpdir(), `tts-${Date.now()}.wav`);
     fs.writeFileSync(tmpFile, Buffer.from(r.data));
-
-    // Read the WAV file back into a buffer for ffmpeg
     const buffer = fs.readFileSync(tmpFile);
-    fs.unlinkSync(tmpFile); // clean up
+    fs.unlinkSync(tmpFile); // cleanup
 
     return buffer;
   } catch (err) {
@@ -142,7 +164,7 @@ async function tts(text) {
 }
 
 /* ============================
-   SEND AUDIO TO TWILIO (Updated)
+   SEND AUDIO TO TWILIO
 ============================ */
 async function sendAudio(ws, buffer) {
   if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
@@ -150,12 +172,11 @@ async function sendAudio(ws, buffer) {
     return;
   }
 
-  // Convert to μ-law 8kHz mono for Twilio
   const mulaw = await convertToMulaw(buffer);
   const FRAME = 160; // 20ms @ 8kHz
   const silence = Buffer.alloc(FRAME, 0xff);
 
-  // Prime with 5 frames silence to avoid Twilio cutting off start
+  // Prime with silence
   for (let i = 0; i < 5; i++) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(20);
@@ -172,7 +193,6 @@ async function sendAudio(ws, buffer) {
 
   log("AUDIO", `Sent ${Math.ceil(mulaw.length / FRAME)} frames`);
 }
-
 
 /* ============================
    GEMINI AI
@@ -216,10 +236,7 @@ wss.on("connection", ws => {
       if (data.event === "start") {
         ws.streamSid = data.start?.streamSid;
         log("TWILIO", "Stream started", ws.streamSid);
-
-        aiSpeaking = true;
-        // Removed default greeting; AI will respond only when caller speaks
-        aiSpeaking = false;
+        aiSpeaking = false; // no greeting, only respond when caller speaks
       }
 
       if (data.event === "media" && !aiSpeaking && dg.readyState === WebSocket.OPEN) {
