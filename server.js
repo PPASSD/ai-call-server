@@ -118,7 +118,7 @@ async function tts(text) {
 ======================== */
 function convertToMulaw(buffer) {
   return new Promise((resolve, reject) => {
-    const ff = spawn("C:\\ffmpeg\\bin\\ffmpeg.exe", [
+    const ff = spawn("ffmpeg", [
       "-hide_banner",
       "-loglevel", "error",
       "-i", "pipe:0",
