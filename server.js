@@ -16,7 +16,7 @@ const {
   GEMINI_MODEL,
   ELEVENLABS_KEY,
   ELEVENLABS_VOICE
-} = process.env.example;
+} = process.env;
 
 // Logging helper
 const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
