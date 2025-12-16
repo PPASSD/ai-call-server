@@ -43,8 +43,9 @@ app.post("/twilio-voice-webhook", (req, res) => {
   <Start>
     <Stream url="wss://ai-call-server-zqvh.onrender.com/stream" track="both"/>
   </Start>
-  <Play>https://ai-call-server-zqvh.onrender.com/silence.mp3</Play>
+  <Pause length="3600"/> <!-- Keep call alive for 1 hour -->
 </Response>
+
   `);
 });
 
