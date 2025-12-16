@@ -17,6 +17,7 @@ const {
   GEMINI_MODEL,
   ELEVENLABS_KEY,
   ELEVENLABS_VOICE,
+  ELEVENLABS_AGENT_ID,
   DEFAULT_PHONE,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
@@ -118,16 +119,37 @@ server.on("upgrade", (req, socket, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   ELEVENLABS TTS
+   ELEVENLABS TTS (Supports Agent or Standard Voice)
 ============================ */
 async function tts(text) {
   try {
     log("ELEVENLABS", "TTS text:", text);
-    const r = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`,
-      { text, model_id: "eleven_monolingual_v1" },
-      { headers: { "xi-api-key": ELEVENLABS_KEY }, responseType: "arraybuffer" }
-    );
+
+    let url, body;
+
+    if (ELEVENLABS_AGENT_ID) {
+      // Use agent TTS endpoint
+      url = `https://api.elevenlabs.io/v1/voice/agents/${ELEVENLABS_AGENT_ID}/stream`;
+      body = {
+        text,
+        voice_settings: {
+          stability: 0.75,
+          similarity_boost: 0.75
+        }
+      };
+    } else if (ELEVENLABS_VOICE) {
+      // Standard TTS voice endpoint
+      url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
+      body = { text, model_id: "eleven_monolingual_v1" };
+    } else {
+      throw new Error("No ElevenLabs voice or agent ID defined in environment variables");
+    }
+
+    const r = await axios.post(url, body, {
+      headers: { "xi-api-key": ELEVENLABS_KEY },
+      responseType: "arraybuffer"
+    });
+
     return Buffer.from(r.data);
   } catch (err) {
     console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
