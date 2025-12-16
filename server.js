@@ -35,9 +35,19 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 /* ============================
    TWILIO VOICE WEBHOOK
 ============================ */
-app.post("/twilio-voice-webhook", (req, res) => {
+app.post("/twilio-voice-webhook", async (req, res) => {
   const callSid = req.body.CallSid || "UNKNOWN";
-  log("TWILIO", "Incoming call", callSid);
+  const contact = req.body.contact || {};
+  log("TWILIO", "Incoming call", callSid, "Contact:", contact);
+
+  // Determine greeting based on tags
+  const firstName = contact.first_name || "there";
+  const tags = contact.tags || [];
+  const isReferral = tags.includes("Referral");
+
+  let greeting = isReferral
+    ? `Hello ${firstName}, this is Greg with Premier Pools & Spas. We received a referral about your pool project. How can I help you today?`
+    : `Hello ${firstName}, this is Greg with Premier Pools & Spas. How can I help you today?`;
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
