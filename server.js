@@ -15,7 +15,8 @@ const {
   GEMINI_API_KEY,
   GEMINI_MODEL,
   ELEVENLABS_KEY,
-  ELEVENLABS_VOICE
+  ELEVENLABS_VOICE,
+  DEFAULT_PHONE
 } = process.env;
 
 // Simple logger with optional debug flag
@@ -34,22 +35,33 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ============================
    TWILIO VOICE WEBHOOK
+   Optimized for GoHighLevel
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
   const callSid = req.body.CallSid || "UNKNOWN";
-  log("TWILIO", "Incoming call", callSid);
+  const phone = req.body.contact?.phone || DEFAULT_PHONE;
+
+  log("TWILIO", "Incoming call from GoHighLevel", callSid, "Dialing:", phone);
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  // TwiML: start stream (both directions) + long pause to keep call alive
+  // TwiML: Dial the contact's phone, attach AI stream after connection
   res.type("text/xml").send(`
 <Response>
+  <Dial action="/twilio-dial-complete" callerId="${DEFAULT_PHONE}">
+    <Number>${phone}</Number>
+  </Dial>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Pause length="3600"/>
 </Response>
   `);
+});
+
+/* Optional endpoint to log when Dial completes */
+app.post("/twilio-dial-complete", (req, res) => {
+  log("TWILIO", "Dial completed", req.body);
+  res.sendStatus(200);
 });
 
 /* ============================
