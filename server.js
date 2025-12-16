@@ -18,8 +18,11 @@ const {
   ELEVENLABS_VOICE
 } = process.env;
 
-// Logging helper
-const log = (flag, ...args) => console.log(`[${flag}]`, ...args);
+// Simple logger with optional debug flag
+const DEBUG = true;
+const log = (flag, ...args) => {
+  if (DEBUG) console.log(`[${flag}]`, ...args);
+};
 
 // Body parsing
 app.use(bodyParser.json());
@@ -33,19 +36,19 @@ app.get("/health", (_, res) => res.json({ ok: true }));
    TWILIO VOICE WEBHOOK
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
-  log("TWILIO", "Incoming call", req.body.CallSid);
+  const callSid = req.body.CallSid || "UNKNOWN";
+  log("TWILIO", "Incoming call", callSid);
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  // TwiML response: start media stream, track both directions
+  // TwiML: start stream (both directions) + long pause to keep call alive
   res.type("text/xml").send(`
 <Response>
   <Start>
-    <Stream url="wss://ai-call-server-zqvh.onrender.com/stream" track="both"/>
+    <Stream url="${wsUrl}" track="both"/>
   </Start>
-  <Pause length="3600"/> <!-- Keep call alive for 1 hour -->
+  <Pause length="3600"/>
 </Response>
-
   `);
 });
 
@@ -56,7 +59,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (!req.url.startsWith("/stream")) return socket.destroy();
+  if (!req.url.startsWith("/stream")) {
+    log("WS", "Rejected upgrade request:", req.url);
+    return socket.destroy();
+  }
   wss.handleUpgrade(req, socket, head, ws => {
     log("WS", "Upgrade OK - new client connected");
     wss.emit("connection", ws);
@@ -114,27 +120,31 @@ function convertToMulaw(buffer) {
    SEND AUDIO TO TWILIO
 ============================ */
 async function sendAudio(ws, buffer) {
-  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) return;
+  if (!ws.streamSid || ws.readyState !== WebSocket.OPEN || !buffer) {
+    log("AUDIO", "Skipped: ws not ready or buffer missing");
+    return;
+  }
 
   const mulaw = await convertToMulaw(buffer);
   const FRAME = 160; // 20ms @ 8kHz
-
-  // Prime with a few silent frames
   const silence = Buffer.alloc(FRAME, 0xff);
+
+  // Prime with 5 frames silence
   for (let i = 0; i < 5; i++) {
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
-    await sleep(25);
+    await sleep(20);
   }
 
+  // Send actual audio frames
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
     if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
     ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
-    await sleep(25);
+    await sleep(20);
   }
 
-  log("AUDIO", "Completed sending audio. Frames:", Math.ceil(mulaw.length / FRAME));
+  log("AUDIO", `Sent ${Math.ceil(mulaw.length / FRAME)} frames`);
 }
 
 /* ============================
@@ -148,7 +158,9 @@ async function callGemini(text) {
       { contents: [{ role: "user", parts: [{ text }] }] },
       { params: { key: GEMINI_API_KEY } }
     );
-    return r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+    const reply = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
+    log("GEMINI", "Reply:", reply);
+    return reply;
   } catch (err) {
     console.error("🔥 GEMINI ERROR", err.response?.data || err.message);
     return null;
@@ -174,13 +186,12 @@ wss.on("connection", ws => {
   ws.on("message", async msg => {
     try {
       const data = JSON.parse(msg.toString());
-
       if (data.event === "start") {
         ws.streamSid = data.start?.streamSid;
         log("TWILIO", "Stream started", ws.streamSid);
 
         aiSpeaking = true;
-        const greeting = await tts("Hello! I'm ready to chat with you.");
+        const greeting = await tts("Hello! I am ready to chat.");
         if (greeting) await sendAudio(ws, greeting);
         aiSpeaking = false;
       }
