@@ -35,10 +35,10 @@ app.get("/health", (_, res) => res.json({ ok: true }));
    TWILIO VOICE WEBHOOK
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
-  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
-  log("TWILIO", "Incoming call", req.body.CallSid);
+  log("TWILIO", "Incoming call", req.body.CallSid, "From:", req.body.From);
 
-  // Simplified TwiML: no long pauses, media starts immediately
+  const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
+
   res.type("text/xml").send(`
 <Response>
   <Start>
@@ -47,6 +47,7 @@ app.post("/twilio-voice-webhook", (req, res) => {
 </Response>
   `);
 });
+
 
 /* ============================
    SERVER + WEBSOCKET
