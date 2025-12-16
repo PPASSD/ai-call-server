@@ -34,20 +34,20 @@ app.get("/health", (_, res) => res.json({ ok: true }));
    TWILIO VOICE WEBHOOK
 ============================ */
 app.post("/twilio-voice-webhook", (req, res) => {
-  const callSid = req.body.CallSid || "UNKNOWN";
-  log("TWILIO", "Incoming call", callSid);
-
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
-  log("TWILIO", "Streaming WebSocket URL:", wsUrl);
+
+  log("TWILIO", "Incoming call", req.body.CallSid);
 
   res.type("text/xml").send(`
 <Response>
   <Start>
     <Stream url="${wsUrl}" track="both"/>
   </Start>
+  <Pause length="60"/>
 </Response>
   `);
 });
+
 
 /* ============================
    SERVER + WEBSOCKET
