@@ -119,28 +119,31 @@ server.on("upgrade", (req, socket, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   ELEVENLABS TTS (Validates Voice ID)
+   ELEVENLABS TTS (Safe Logging, No Voice GET)
 ============================ */
 async function tts(text) {
   try {
-    if (!ELEVENLABS_VOICE) {
-      throw new Error("No ElevenLabs voice ID defined in environment variables");
-    }
+    log("ELEVENLABS", `Generating speech using voice/agent ID: ${ELEVENLABS_AGENT_ID || ELEVENLABS_VOICE}`);
 
-    // Validate voice ID before TTS
-    try {
-      const voiceInfo = await axios.get(
-        `https://api.elevenlabs.io/v1/voices/${ELEVENLABS_VOICE}`,
-        { headers: { "xi-api-key": ELEVENLABS_KEY } }
-      );
-      log("ELEVENLABS", "Using voice:", voiceInfo.data.name, `(ID: ${ELEVENLABS_VOICE})`);
-    } catch (err) {
-      console.warn("🔥 ELEVENLABS WARNING: Voice ID may be invalid", ELEVENLABS_VOICE, err.response?.data || err.message);
-    }
+    let url, body;
 
-    // Generate speech
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
-    const body = { text, model_id: "eleven_monolingual_v1" };
+    if (ELEVENLABS_AGENT_ID) {
+      // Agent TTS endpoint
+      url = `https://api.elevenlabs.io/v1/voice/agents/${ELEVENLABS_AGENT_ID}/stream`;
+      body = {
+        text,
+        voice_settings: {
+          stability: 0.75,
+          similarity_boost: 0.75
+        }
+      };
+    } else if (ELEVENLABS_VOICE) {
+      // Standard TTS voice endpoint
+      url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
+      body = { text, model_id: "eleven_monolingual_v1" };
+    } else {
+      throw new Error("No ElevenLabs voice or agent ID defined in environment variables");
+    }
 
     const r = await axios.post(url, body, {
       headers: { "xi-api-key": ELEVENLABS_KEY },
@@ -153,8 +156,6 @@ async function tts(text) {
     return null;
   }
 }
-
-
 /* ============================
    CONVERT AUDIO TO MULAW
 ============================ */
