@@ -128,33 +128,39 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 ============================ */
 async function tts(text) {
   try {
-    const voiceOrAgent = ELEVENLABS_AGENT_ID || ELEVENLABS_VOICE;
-    log("ELEVENLABS", `Generating speech using voice/agent ID: ${voiceOrAgent}`);
-
-    let url, body;
-    if (ELEVENLABS_AGENT_ID) {
-      url = `https://api.elevenlabs.io/v1/voice/agents/${ELEVENLABS_AGENT_ID}/stream`;
-      body = { text, voice_settings: { stability: 0.75, similarity_boost: 0.75 } };
-    } else if (ELEVENLABS_VOICE) {
-      url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
-      body = { text, model_id: "eleven_monolingual_v1" };
-    } else {
-      throw new Error("No ElevenLabs voice or agent ID defined in environment variables");
+    if (!ELEVENLABS_VOICE) {
+      throw new Error("ELEVENLABS_VOICE is required (Agent IDs do NOT work for TTS)");
     }
 
-    const r = await axios.post(url, body, {
-      headers: { "xi-api-key": ELEVENLABS_KEY },
-      responseType: "arraybuffer"
-    });
+    log("ELEVENLABS", `Generating TTS using voice ID: ${ELEVENLABS_VOICE}`);
 
-    log("ELEVENLABS", `TTS generated successfully using ${voiceOrAgent}`);
+    const r = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+      {
+        text,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: {
+          stability: 0.7,
+          similarity_boost: 0.75
+        }
+      },
+      {
+        headers: {
+          "xi-api-key": ELEVENLABS_KEY,
+          "Content-Type": "application/json"
+        },
+        responseType: "arraybuffer"
+      }
+    );
+
+    log("ELEVENLABS", "TTS audio generated successfully");
     return Buffer.from(r.data);
+
   } catch (err) {
     console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
     return null;
   }
 }
-
 /* ============================
    CONVERT AUDIO TO MULAW
 ============================ */
