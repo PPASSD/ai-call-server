@@ -135,23 +135,23 @@ async function tts(text) {
     log("ELEVENLABS", `Generating TTS using voice ID: ${ELEVENLABS_VOICE}`);
 
     const r = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
-      {
-        text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: {
-          stability: 0.7,
-          similarity_boost: 0.75
-        }
-      },
-      {
-        headers: {
-          "xi-api-key": ELEVENLABS_KEY,
-          "Content-Type": "application/json"
-        },
-        responseType: "arraybuffer"
-      }
-    );
+  `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+  {
+    text,
+    model_id: "eleven_flash_v2_5",
+    voice_settings: {
+      stability: 0.7,
+      similarity_boost: 0.75
+    }
+  },
+  {
+    headers: {
+      "xi-api-key": ELEVENLABS_KEY,
+      "Content-Type": "application/json"
+    },
+    responseType: "arraybuffer"
+  }
+);
 
     log("ELEVENLABS", "TTS audio generated successfully");
     return Buffer.from(r.data);
