@@ -53,7 +53,13 @@ app.post("/go-highlevel-webhook", async (req, res) => {
       return res.status(400).send("No phone number provided");
     }
 
+    const firstName = req.body.contact?.first_name || "";
+    const lastName = req.body.contact?.last_name || "";
+
     log("GHL", "Attempting to call phone:", phone);
+
+    // Store GoHighLevel info for later use in prompts
+    req.app.locals.ghlContact = { firstName, lastName, phone };
 
     // Create Twilio call
     const twilioCall = await twilioClient.calls.create({
@@ -81,7 +87,6 @@ app.post("/twilio-voice-webhook", (req, res) => {
 
   const wsUrl = `wss://${PUBLIC_HOST.replace(/^https?:\/\//, "")}/stream`;
 
-  // Start Twilio <Stream> for AI
   res.type("text/xml").send(`
 <Response>
   <Start>
@@ -119,26 +124,18 @@ server.on("upgrade", (req, socket, head) => {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================
-   ELEVENLABS TTS (Safe Logging, No Voice GET)
+   ELEVENLABS TTS (Agent ID Priority, Safe Logging)
 ============================ */
 async function tts(text) {
   try {
-    log("ELEVENLABS", `Generating speech using voice/agent ID: ${ELEVENLABS_AGENT_ID || ELEVENLABS_VOICE}`);
+    const voiceOrAgent = ELEVENLABS_AGENT_ID || ELEVENLABS_VOICE;
+    log("ELEVENLABS", `Generating speech using voice/agent ID: ${voiceOrAgent}`);
 
     let url, body;
-
     if (ELEVENLABS_AGENT_ID) {
-      // Agent TTS endpoint
       url = `https://api.elevenlabs.io/v1/voice/agents/${ELEVENLABS_AGENT_ID}/stream`;
-      body = {
-        text,
-        voice_settings: {
-          stability: 0.75,
-          similarity_boost: 0.75
-        }
-      };
+      body = { text, voice_settings: { stability: 0.75, similarity_boost: 0.75 } };
     } else if (ELEVENLABS_VOICE) {
-      // Standard TTS voice endpoint
       url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}/stream`;
       body = { text, model_id: "eleven_monolingual_v1" };
     } else {
@@ -150,12 +147,14 @@ async function tts(text) {
       responseType: "arraybuffer"
     });
 
+    log("ELEVENLABS", `TTS generated successfully using ${voiceOrAgent}`);
     return Buffer.from(r.data);
   } catch (err) {
     console.error("🔥 ELEVENLABS ERROR", err.response?.data || err.message);
     return null;
   }
 }
+
 /* ============================
    CONVERT AUDIO TO MULAW
 ============================ */
@@ -195,26 +194,16 @@ async function sendAudio(ws, buffer) {
   const FRAME = 160; // 20ms @ 8kHz
   const silence = Buffer.alloc(FRAME, 0xff);
 
-  // Prime with 5 frames silence
   for (let i = 0; i < 5; i++) {
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid: ws.streamSid,
-      media: { payload: silence.toString("base64"), track: "outbound" }
-    }));
+    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: silence.toString("base64"), track: "outbound" } }));
     await sleep(20);
   }
 
-  // Send actual audio frames
   for (let i = 0; i < mulaw.length; i += FRAME) {
     if (ws.readyState !== WebSocket.OPEN) break;
     let chunk = mulaw.slice(i, i + FRAME);
     if (chunk.length < FRAME) chunk = Buffer.concat([chunk, Buffer.alloc(FRAME - chunk.length, 0xff)]);
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid: ws.streamSid,
-      media: { payload: chunk.toString("base64"), track: "outbound" }
-    }));
+    ws.send(JSON.stringify({ event: "media", streamSid: ws.streamSid, media: { payload: chunk.toString("base64"), track: "outbound" } }));
     await sleep(20);
   }
 
@@ -222,16 +211,23 @@ async function sendAudio(ws, buffer) {
 }
 
 /* ============================
-   GEMINI AI
+   GEMINI AI (Inject GHL Contact)
 ============================ */
-async function callGemini(text) {
+async function callGemini(userText, ghlContact = {}) {
   try {
-    log("GEMINI", "Prompt:", text);
+    let prompt = userText;
+    if (ghlContact.firstName || ghlContact.lastName || ghlContact.phone) {
+      prompt = `Contact Info: ${ghlContact.firstName || ""} ${ghlContact.lastName || ""} (${ghlContact.phone || ""}).\nUser says: ${userText}`;
+    }
+
+    log("GEMINI", "Prompt:", prompt);
+
     const r = await axios.post(
       `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`,
-      { contents: [{ role: "user", parts: [{ text }] }] },
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
       { params: { key: GEMINI_API_KEY } }
     );
+
     const reply = r.data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
     log("GEMINI", "Reply:", reply);
     return reply;
@@ -287,7 +283,7 @@ wss.on("connection", ws => {
       log("DEEPGRAM", "FINAL transcript:", transcript);
 
       aiSpeaking = true;
-      const reply = await callGemini(transcript);
+      const reply = await callGemini(transcript, app.locals.ghlContact);
       if (reply) {
         const replyBuffer = await tts(reply);
         if (replyBuffer) await sendAudio(ws, replyBuffer);
